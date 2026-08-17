@@ -3644,6 +3644,7 @@ struct behavior *b;
 #endif /* not TRILIBRARY */
 }
 
+
 /**                                                                         **/
 /**                                                                         **/
 /********* User interaction routines begin here                      *********/
@@ -9448,11 +9449,7 @@ int axis;
   int badedge;
   int leftfinished, rightfinished;
   triangle ptr;                         /* Temporary variable used by sym(). */
-  VOID* testptr;
   int i;
-
-  testptr=**(farright->tri);
-  testptr=**(farleft->tri);
 
   dest(*innerleft, innerleftdest);
   apex(*innerleft, innerleftapex);
@@ -16011,4 +16008,3 @@ char **argv;
   return 0;
 #endif /* not TRILIBRARY */
 }
-

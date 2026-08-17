@@ -57,8 +57,8 @@ else
   LINEFLAG :=
 endif
 
-# C flags (triangle needs TRILIBRARY)
-CFLAGS ?= -O2 -DTRILIBRARY
+# C flags for the bundled Triangle wrapper
+CFLAGS ?= -O2 -DANSI_DECLARATORS
 
 # Fortran flags: base
 FFLAGS_BASE := $(OMPFLAG) $(MODFLAG) -I$(MOD_DIR) $(NC_FFLAGS) $(PPFLAG) $(LINEFLAG)
