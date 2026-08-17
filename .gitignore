@@ -3,3 +3,6 @@
 
 # local Linux build artefacts (make)
 SnapWave/lnx64/
+
+# Rust / Cargo
+/target

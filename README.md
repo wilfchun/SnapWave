@@ -25,3 +25,32 @@ To automatically remove module and object files, run with
 make clean
 make STRIP_BUILD=1
 ```
+
+## Rust wrapper (Cargo)
+
+A minimal Rust binary wraps the unchanged Fortran solver through a coarse C ABI
+(`src/snapwave_c_api.f90`) and Cargo orchestrates the full build: Rust, Fortran
+objects, the bundled Triangle C code, NetCDF flags and final linking.
+
+``` bash
+# build wrapper + all Fortran/C objects (requires gfortran, cc, nf-config)
+cargo build
+
+# smoke test: runs the coarse linear shoaling/refraction testcase and
+# verifies the generated NetCDF map/history outputs (uses ncdump if present)
+cargo test
+
+# run the model through the Rust wrapper
+cargo run -- path/to/SnapWave.inp
+```
+
+Notes:
+- The Fortran input reader resolves all paths relative to the working
+  directory, so the wrapper changes to the input file's directory and passes
+  only the file name across the FFI boundary.
+- The checked-in `testcases/31_linear_shoaling_refraction/run/coarse/SnapWave.inp`
+  uses Windows path separators (`..\`); on Linux, copy the testcase and
+  normalize them first (`sed -i 's|\\|/|g' SnapWave.inp`). `cargo test` does
+  this automatically on a temp copy.
+- `DEBUG=1 cargo build` mirrors `make DEBUG=1` (g, O0, checks, backtrace).
+- The `make`-based stand-alone Fortran build remains available unchanged.

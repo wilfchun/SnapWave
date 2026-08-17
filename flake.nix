@@ -138,6 +138,8 @@
                 pkgs.curl
                 pkgs.netcdf # ncdump & friends to inspect output files
                 pkgs.gnumake
+                pkgs.rustc # Rust toolchain for the Cargo-orchestrated wrapper
+                pkgs.cargo
               ]
               ++ nixpkgs.lib.optionals
                 pkgs.stdenv.hostPlatform.isLinux
@@ -148,6 +150,8 @@
               echo "  make             release build  -> SnapWave/lnx64/bin/snapwave"
               echo "  make DEBUG=1     debug build (-g -O0 -fcheck=all -fbacktrace)"
               echo "  make clean       remove build artefacts"
+              echo "  cargo build      Rust wrapper + all Fortran/C objects"
+              echo "  cargo test       build + run the coarse testcase smoke test"
               echo "  nix flake check  build + run the testcase smoke test"
             '';
           };
