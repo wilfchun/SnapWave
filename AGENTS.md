@@ -57,7 +57,7 @@ Phase 6 (outside-in rewrites) is the active frontier.
 | `flake.nix` | Nix dev shell, package and smoke-test check |
 | `third_party_open/` | Bundled Triangle (C) and kdtree2 (Fortran) |
 | `utils_lgpl/` | Deltares common utils + kdtree wrapper |
-| `tests/mwe.rs` | Cargo integration/smoke test (MWE regression) |
+| `tests/` | Cargo integration tests: `mwe.rs` smoke test; Phase-1 harness (`regression.rs`, `support/`, see `tests/README.md`) |
 | `testcases/` | Validation cases; `31_linear_shoaling_refraction/run/coarse` is the MWE regression target |
 | `plan.md` | Migration plan (phases, constraints, risks) |
 | `doc/` | Reference manuals (physics; consult before touching numerics) |
@@ -98,9 +98,13 @@ Environment variables respected by `build.rs`: `FC`, `CC`, `NF_CONFIG`,
 - Existing checks are structural: exit status, output file presence, NetCDF
   headers via `ncdump -h`. **Any change touching output or migrated
   subsystems must extend `tests/mwe.rs`** (or add tests) to cover it.
-  Numeric comparisons against committed references with tolerances come next;
-  exact floating-point reproducibility is not expected — define tolerances
+  Exact floating-point reproducibility is not expected — define tolerances
   when adding numeric checks.
+- Phase-1 numeric regression lives in `tests/regression.rs`: wrapper output
+  is compared against committed testcase reference NetCDF files and, when the
+  legacy `make` build exists (or `SNAPWAVE_ORACLE` is set), against the live
+  Fortran oracle. Per-variable tolerances live in
+  `tests/support/compare.rs`; see `tests/README.md` before adding cases.
 - Each newly migrated subsystem keeps the Fortran path callable as the
   oracle and is validated against it before the Fortran side is retired.
 
