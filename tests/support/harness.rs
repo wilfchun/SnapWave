@@ -28,7 +28,8 @@ use anyhow::{bail, Context, Result};
 const SKIP_DIRS: [&str; 5] = [".svn", "scripts", "results", "analytical", "output"];
 
 /// Input file names probed by `read_snapwave_input` (src/snapwave_input.f90).
-const INPUT_NAMES: [&str; 6] =
+/// Also used by `tests/input_parse.rs` to find every checked-in input.
+pub const INPUT_NAMES: [&str; 6] =
     ["snapwave.inp", "SnapWave.inp", "SNAPWAVE.INP", "snapwave.INP", "Snapwave.INP", "SNAPWAVE.inp"];
 
 pub struct CaseSpec {

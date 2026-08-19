@@ -2,20 +2,27 @@ module snapwave_input
    implicit none
 contains
 
-   subroutine read_snapwave_input()
+   subroutine read_snapwave_input(input_file)
       !
       ! Reads snapwave.inp
+      !
+      ! The optional input_file argument (plan.md Phase 3, step 6) lets the
+      ! C ABI facade pass the Rust-selected input file explicitly. Without
+      ! it, the legacy stand-alone behaviour is preserved: probe the usual
+      ! file names in the current working directory.
       !
       use snapwave_data
       use snapwave_date
       !
       implicit none
       !
+      character(len=*), optional, intent(in) :: input_file
+      !
       integer :: dtsec
       integer :: irestart
       integer :: iwritetestfiles
       !
-      character(len=256) :: filename
+      character(len=1024) :: filename
       integer :: ios, ii
       logical :: exists
 
@@ -26,18 +33,34 @@ contains
 
       write (*, *) 'Reading input file ...'
 
-      do ii = 1, size(possible_names)
-         filename = trim(possible_names(ii))
-         inquire (file=filename, exist=exists, iostat=ios)
-         if (exists .and. ios == 0) exit
-      end do
-
-      if (.not. exists) then
-         write (*, *) 'ERROR: none of the expected input files were found:'
+      if (present(input_file)) then
+         !
+         ! Rust-selected input file: no probing; the wrapper has already
+         ! validated and selected this exact file (plan.md Phase 3).
+         !
+         filename = trim(input_file)
+         inquire (file=trim(filename), exist=exists, iostat=ios)
+         if (.not. (exists .and. ios == 0)) then
+            write (*, *) 'ERROR: input file not found: ', trim(filename)
+            stop 1
+         end if
+      else
+         !
+         ! Legacy stand-alone behaviour: probe the usual names in the CWD.
+         !
          do ii = 1, size(possible_names)
-            write (*, *) '   - ', trim(possible_names(ii))
+            filename = trim(possible_names(ii))
+            inquire (file=filename, exist=exists, iostat=ios)
+            if (exists .and. ios == 0) exit
          end do
-         stop 1
+
+         if (.not. exists) then
+            write (*, *) 'ERROR: none of the expected input files were found:'
+            do ii = 1, size(possible_names)
+               write (*, *) '   - ', trim(possible_names(ii))
+            end do
+            stop 1
+         end if
       end if
 
       open (unit=500, file=trim(filename), status='old', action='read', iostat=ios)

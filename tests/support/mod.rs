@@ -11,7 +11,8 @@
 //! See `tests/README.md` for how to add new cases.
 //!
 //! `allow(dead_code)`: this module is compiled into several test crates
-//! (regression.rs, ncdf_parser.rs) that each use only part of the API.
+//! (regression.rs, ncdf_parser.rs, cli.rs) that each use only part of the
+//! API.
 
 #![allow(dead_code)]
 

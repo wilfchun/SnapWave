@@ -39,9 +39,9 @@ Important follow-up items:
   the bootstrap but should be removed when input parsing moves to Rust.
 - `read_snapwave_input()` still contains `stop 1` paths. Any error path made
   reachable from Rust-owned orchestration should become a status/error return.
-- `flake.nix` currently packages the legacy Makefile executable, while Cargo
-  builds the Rust wrapper. Align Nix checks/package outputs with the Cargo
-  wrapper before relying on Nix as migration CI.
+- Resolved in Phase 2: the Nix default package and the smoke-test check now
+  build and run the Cargo wrapper; the legacy Makefile executable stays
+  available as `packages.snapwave-legacy` (the Fortran oracle).
 - The smoke test validates execution and NetCDF shape, not numeric equivalence.
   Numeric baselines are required before replacing domain, boundary, or solver
   behaviour.
@@ -116,6 +116,27 @@ Acceptance:
 - The same testcase runs through `cargo run`, `cargo test`, and Nix checks.
 - Fortran still receives only the minimum information needed to run.
 
+Status: implemented (2026-08-18). The CLI lives in `src_rust/cli.rs`
+(hand-rolled, no new dependencies): `--help`/`-h`, `--version`/`-V`,
+`--verbose`, `--` separator and exactly one positional input path, parsed
+from OS strings so invalid UTF-8 is a clean error rather than a panic.
+Status codes: 0 for success (including help/version), 2 for
+wrapper-detected errors, Fortran statuses passed through unchanged. The
+process-level run state lives in `src_rust/run_context.rs` as `RunContext`
+(input path as given plus resolved, run directory, output-directory
+expectation — `None` until Phase 5 owns output policy —, executable
+metadata, logging preferences). The legacy `chdir` contract is isolated in
+`RunContext::enter_run_dir()` and the FFI file-name conversion in
+`RunContext::input_file_name_cstring()` (raw bytes on Unix, NUL-rejecting)
+so Phase 5 can remove them cleanly. Integration tests in `tests/cli.rs`
+cover the flags, usage errors, missing/directory/invalid-UTF-8 input and a
+relative-path run of the coarse testcase (embedded NUL cannot cross
+`execve`, so it is unit-tested at the conversion boundary).
+`flake.nix` now builds and smoke-tests the Cargo wrapper as the default
+package (`packages.snapwave`, via `rustPlatform.buildRustPackage` with the
+committed `Cargo.lock`); the legacy `make` build remains available as
+`packages.snapwave-legacy` for use as the `SNAPWAVE_ORACLE` oracle.
+
 ## Phase 3: SnapWave.inp Parsing In Rust
 
 Goal: parse and validate the main configuration file in Rust, while still
@@ -142,6 +163,33 @@ Acceptance:
 - Rust can parse every checked-in `SnapWave.inp`.
 - Rust parse results match Fortran globals for representative cases.
 - Wrapper failures for invalid input are Rust errors, not Fortran `stop`.
+
+Status: implemented (2026-08-19). The parser lives in `src_rust/input.rs`
+with the grammar documented in its module docs (step 1) and configuration
+as typed structs grouped by concern (step 3). Legacy semantics are
+preserved verbatim, including the quirks: per-key first-match-wins,
+case-sensitive exact key matching (leading blanks break matching), records
+without `=` and unknown keywords silently ignored, Fortran
+list-directed value semantics (including `D` exponents and first-token
+extraction), the 256-character line buffer, per-field character
+truncation widths (15/232/256), `map_interval`/`his_interval` defaulting
+to the parsed `timestep` (with the non-positive-interval `stop 1` checks
+converted to Rust errors), the string-equality `u10 == '0.0'` wind
+switch, `mmax`/`nmax` plus two dummy rows, and `tstart`/`tstop` computed
+with the same Fliegel & Van Flandern Julian-day arithmetic. The
+temporary comparison hook (step 5) is `snapwave_read_input_dump_c` in
+`src/snapwave_c_api.f90`, exposed through the wrapper's `--compare-input`
+mode (`src_rust/input_compare.rs`): it runs the legacy Fortran reader
+with the Rust-selected file name and dumps every global it sets
+(reals as exact IEEE bit patterns); `tests/input_parse.rs` asserts
+agreement for every checked-in testcase input plus quirk and invalid-input
+cases. Step 6 is done via the optional `input_file` argument of
+`read_snapwave_input()` (the stand-alone `make` build keeps the
+name-probing behaviour), and the wrapper now parses and validates the
+input in Rust before calling the facade, so invalid input is a wrapper
+error (exit 2) with the Fortran core never invoked. Defaults, broader
+validation and the remaining input-reader `stop` paths stay Fortran-owned
+until Phase 4.
 
 ## Phase 4: Config Defaults, Validation, And Diagnostics
 

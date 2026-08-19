@@ -11,6 +11,8 @@ build internals.
 | --- | --- |
 | `mwe.rs` | Original MWE smoke test (structure only, `ncdump`-optional) |
 | `regression.rs` | Phase-1 regression: runs cases and compares NetCDF output against committed baselines and the live Fortran oracle |
+| `cli.rs` | Phase-2 CLI tests: help/version/usage errors, unusable input paths (missing, directory, invalid UTF-8), relative-path run of the coarse testcase |
+| `input_parse.rs` | Phase-3 input parsing: Rust-vs-Fortran parse comparison for every checked-in `SnapWave.inp`, grammar-quirk agreement, invalid-input wrapper errors |
 | `ncdf_parser.rs` | Self-tests of the NetCDF reader against committed fixtures (no model run) |
 | `support/ncdf.rs` | Dependency-free reader for NetCDF classic (CDF-1/CDF-2) files |
 | `support/harness.rs` | Testcase copying, separator normalization, wrapper/oracle execution |
@@ -40,6 +42,25 @@ Each regression case:
 Both binaries run with `OMP_NUM_THREADS=1`: OpenMP reduction order changes
 floating-point summation order, which would make numeric comparisons flaky
 without any scientific meaning.
+
+## Input parsing (Phase 3)
+
+`input_parse.rs` exercises the temporary comparison hook
+`snapwave_read_input_dump_c` (`src/snapwave_c_api.f90`) through the
+wrapper's `--compare-input` mode: both the Rust parser
+(`src_rust/input.rs`) and the legacy Fortran reader parse the same file,
+and every resulting global must agree (reals via exact IEEE bit patterns
+with a 1e-6 relative fallback for the `atan`-based `sigmin`/`sigmax`
+defaults). The checked-in testcase inputs are used read-only and directly
+— the parse resolves no sibling paths, so no temp copies are needed. The
+hook, the `--compare-input` mode and `src_rust/input_compare.rs` are
+scaffolding that gets removed once plan.md Phase 4+ retires the Fortran
+input reader from the Rust path. Invalid inputs (bad numbers, bad dates,
+non-positive output intervals with output enabled) must fail with wrapper
+exit code 2 *before* the Fortran core is invoked.
+
+The full `SnapWave.inp` grammar — keyword matching, quirks, defaults — is
+documented in the module docs of `src_rust/input.rs`.
 
 ## The Fortran oracle
 

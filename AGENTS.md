@@ -17,9 +17,12 @@ Rust using a **strangler fig** approach:
 - the Fortran implementation stays available as the oracle until each migrated
   Rust path passes regression.
 
-Current state: plan.md Phases 0–5 are complete (baseline, Cargo skeleton, C
-ABI facade, Cargo-orchestrated build/link, Rust wrapper, MWE smoke test).
-Phase 6 (outside-in rewrites) is the active frontier.
+Current state: the Cargo-orchestrated wrapper/bootstrap is complete, and
+plan.md Phases 1 (test oracle and baselines), 2 (Rust CLI and run
+context) and 3 (`SnapWave.inp` parsing in Rust, validated against the
+Fortran reader through the temporary `--compare-input` hook) are done.
+Phase 4 (config defaults, validation, and diagnostics) is the active
+frontier.
 
 ## Non-negotiable rules
 
@@ -37,10 +40,11 @@ Phase 6 (outside-in rewrites) is the active frontier.
 4. **`src/snapwave.f90` is deliberately not compiled into the Cargo binary**
    (Rust provides `main`). When changing the model lifecycle, keep
    `src/snapwave.f90` and `src/snapwave_c_api.f90` in sync.
-5. **Follow the Phase 6 migration order** when picking what to move next:
-   CLI args → `SnapWave.inp` parsing → config defaults/diagnostics → output
-   directory handling → text input readers → NetCDF output → mesh/domain
-   data structures → solver internals. Do not jump ahead to the solver.
+5. **Follow the plan.md phase order** when picking what to move next
+   (currently: CLI args → `SnapWave.inp` parsing → config
+   defaults/diagnostics → output directory handling → text input readers →
+   NetCDF output → mesh/domain data structures → solver internals). Do not
+   jump ahead to the solver.
 6. **Third-party code is read-only in practice.** Do not modify
    `third_party_open/` or `utils_lgpl/` except for build integration fixes.
    Keep licensing (LGPL, see `LICENSE`) intact.
@@ -57,7 +61,7 @@ Phase 6 (outside-in rewrites) is the active frontier.
 | `flake.nix` | Nix dev shell, package and smoke-test check |
 | `third_party_open/` | Bundled Triangle (C) and kdtree2 (Fortran) |
 | `utils_lgpl/` | Deltares common utils + kdtree wrapper |
-| `tests/` | Cargo integration tests: `mwe.rs` smoke test; Phase-1 harness (`regression.rs`, `support/`, see `tests/README.md`) |
+| `tests/` | Cargo integration tests: `mwe.rs` smoke test; Phase-1 harness (`regression.rs`, `support/`, see `tests/README.md`); Phase-2 CLI tests (`cli.rs`) |
 | `testcases/` | Validation cases; `31_linear_shoaling_refraction/run/coarse` is the MWE regression target |
 | `plan.md` | Migration plan (phases, constraints, risks) |
 | `doc/` | Reference manuals (physics; consult before touching numerics) |
@@ -72,14 +76,17 @@ shell provides everything: `nix develop` (or direnv).
 ```sh
 cargo build                        # Rust + all Fortran/C objects + link
 DEBUG=1 cargo build                # mirrors `make DEBUG=1` (g, O0, checks)
-cargo test                         # MWE smoke test on the coarse testcase
+cargo test                         # smoke, regression and CLI tests
 cargo run -- path/to/SnapWave.inp  # run the model through the wrapper
+cargo run -- --help                # wrapper CLI usage (Phase 2)
 
 make                # legacy stand-alone Fortran build (must keep working)
 make DEBUG=1
 make clean
 
-nix flake check     # Nix build + smoke test
+nix build                    # default package: Cargo-built Rust wrapper
+nix build .#snapwave-legacy  # legacy Makefile build (the Fortran oracle)
+nix flake check              # Nix build + smoke test of the Rust wrapper
 ```
 
 Environment variables respected by `build.rs`: `FC`, `CC`, `NF_CONFIG`,
@@ -93,8 +100,12 @@ Environment variables respected by `build.rs`: `FC`, `CC`, `NF_CONFIG`,
   copies** (`cargo test` and the flake check already do this). Never commit
   modified testcase inputs.
 - The wrapper `chdir`s to the input file's parent and passes only the file
-  name across FFI, because the Fortran reader resolves paths relative to the
-  CWD. Preserve this contract until input parsing moves to Rust.
+  name across FFI, because the Fortran readers resolve sibling input and
+  output paths relative to the CWD (the input file itself has been
+  Rust-selected and passed explicitly since Phase 3). Preserve this
+  contract until the remaining readers and output handling move to Rust
+  (Phases 5-6). The chdir is isolated in `RunContext::enter_run_dir()`
+  (`src_rust/run_context.rs`) so plan.md Phase 5 can remove it cleanly.
 - Existing checks are structural: exit status, output file presence, NetCDF
   headers via `ncdump -h`. **Any change touching output or migrated
   subsystems must extend `tests/mwe.rs`** (or add tests) to cover it.

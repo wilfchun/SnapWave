@@ -18,7 +18,7 @@
       # Keep only what is needed to build: Makefile, Fortran/C sources and the
       # bundled third_party code. Excludes Windows project files, docs,
       # testcases, the prebuilt zip and the Windows-only netcdf binaries.
-      buildSource = pkgs:
+      legacySource = pkgs:
         pkgs.lib.cleanSourceWith {
           src = self;
           filter =
@@ -31,12 +31,84 @@
             && rel != "third_party_open/netcdf";
         };
 
+      # Sources for the Cargo-orchestrated Rust wrapper (plan.md Phase 2,
+      # step 5): Rust sources plus everything build.rs compiles and links.
+      cargoSource = pkgs:
+        pkgs.lib.cleanSourceWith {
+          src = self;
+          filter =
+            path: type:
+            let
+              rel = pkgs.lib.removePrefix (toString self + "/") (toString path);
+              top = builtins.head (pkgs.lib.splitString "/" rel);
+            in
+            builtins.elem top [
+              "Cargo.toml"
+              "Cargo.lock"
+              "build.rs"
+              "src_rust"
+              "src"
+              "utils_lgpl"
+              "third_party_open"
+            ]
+            && rel != "third_party_open/netcdf";
+        };
+
+      # The production binary: Rust wrapper + Fortran core, built by Cargo
+      # (build.rs orchestrates the Fortran/C compilation and linking).
       mkSnapwave = pkgs:
-        pkgs.stdenv.mkDerivation (finalAttrs: {
+        pkgs.rustPlatform.buildRustPackage {
           pname = "snapwave";
           version = "unstable-${self.shortRev or "dirty"}";
 
-          src = buildSource pkgs;
+          src = cargoSource pkgs;
+          cargoLock.lockFile = ./Cargo.lock;
+
+          nativeBuildInputs = [ pkgs.gfortran ];
+          buildInputs = [
+            pkgs.netcdffortran
+            pkgs.netcdf
+            pkgs.hdf5
+            pkgs.zlib
+            pkgs.curl
+          ];
+
+          # build.rs drives gfortran/cc/nf-config itself (same contract as
+          # `cargo build` in the dev shell); absolute paths keep the build
+          # independent of PATH lookups under strictDeps.
+          FC = "${pkgs.gfortran}/bin/gfortran";
+          CC = "${pkgs.stdenv.cc}/bin/cc";
+          NF_CONFIG = "${pkgs.lib.getDev pkgs.netcdffortran}/bin/nf-config";
+
+          # The Fortran module compile order is not parallel-safe (build.rs
+          # compiles the sources serially in Makefile order).
+          enableParallelBuilding = false;
+
+          # Integration tests need the testcases/ tree and a live oracle;
+          # they run via `cargo test` in the dev shell, not in the sandbox.
+          doCheck = false;
+
+          # Default install phase (cargoInstallHook) picks the binary from
+          # the target dir cargo actually used (with or without a target
+          # triple) and installs it as $out/bin/snapwave.
+
+          meta = {
+            description = "Fast, implicit, unstructured-grid short wave solver";
+            mainProgram = "snapwave";
+            license = nixpkgs.lib.licenses.lgpl21;
+            platforms = nixpkgs.lib.platforms.unix;
+          };
+        };
+
+      # The legacy stand-alone Makefile build (argument-less Fortran
+      # binary). Kept until Phase 12 as the numerical oracle: point
+      # SNAPWAVE_ORACLE at it for wrapper-vs-oracle regression runs.
+      mkSnapwaveLegacy = pkgs:
+        pkgs.stdenv.mkDerivation (finalAttrs: {
+          pname = "snapwave-legacy";
+          version = "unstable-${self.shortRev or "dirty"}";
+
+          src = legacySource pkgs;
 
           nativeBuildInputs = [ pkgs.gfortran ];
           buildInputs = [
@@ -66,7 +138,7 @@
           '';
 
           meta = {
-            description = "Fast, implicit, unstructured-grid short wave solver";
+            description = "SnapWave legacy stand-alone Fortran build (numerical oracle)";
             mainProgram = "snapwave";
             license = nixpkgs.lib.licenses.lgpl21;
             platforms = nixpkgs.lib.platforms.unix;
@@ -78,11 +150,11 @@
         system:
         let
           pkgs = nixpkgs.legacyPackages.${system};
-          snapwave = mkSnapwave pkgs;
         in
         {
-          inherit snapwave;
-          default = snapwave;
+          snapwave = mkSnapwave pkgs;
+          snapwave-legacy = mkSnapwaveLegacy pkgs;
+          default = mkSnapwave pkgs;
         }
       );
 
@@ -91,8 +163,9 @@
         let pkgs = nixpkgs.legacyPackages.${system};
         in
         {
-          # Smoke test: run the "linear shoaling & refraction" coarse testcase
-          # (2 timesteps, small grid) and verify that the solver exits cleanly
+          # Smoke test (plan.md Phase 2, step 5): run the "linear shoaling
+          # & refraction" coarse testcase (2 timesteps, small grid) through
+          # the Cargo-built Rust wrapper and verify that it exits cleanly
           # and produces valid NetCDF map/history output.
           smoke-test = pkgs.stdenvNoCC.mkDerivation {
             name = "snapwave-smoke-test";
@@ -109,7 +182,10 @@
 
               mkdir -p ../../output
 
-              ${self.packages.${system}.snapwave}/bin/snapwave > logfile.txt
+              # The wrapper takes the input path as an argument and changes
+              # to the input directory itself; a relative argument doubles
+              # as a relative-path-handling check.
+              ${self.packages.${system}.snapwave}/bin/snapwave --verbose SnapWave.inp > logfile.txt 2>&1
 
               test -f ../../output/shoalref_coarse_neu_map.nc
               test -f ../../output/shoalref_coarse_neu_his.nc
@@ -147,12 +223,13 @@
 
             shellHook = ''
               echo "SnapWave dev shell"
-              echo "  make             release build  -> SnapWave/lnx64/bin/snapwave"
-              echo "  make DEBUG=1     debug build (-g -O0 -fcheck=all -fbacktrace)"
-              echo "  make clean       remove build artefacts"
-              echo "  cargo build      Rust wrapper + all Fortran/C objects"
-              echo "  cargo test       build + run the coarse testcase smoke test"
-              echo "  nix flake check  build + run the testcase smoke test"
+              echo "  make                    release build  -> SnapWave/lnx64/bin/snapwave"
+              echo "  make DEBUG=1            debug build (-g -O0 -fcheck=all -fbacktrace)"
+              echo "  make clean              remove build artefacts"
+              echo "  cargo build             Rust wrapper + all Fortran/C objects"
+              echo "  cargo test              build + run tests (smoke, regression, CLI)"
+              echo "  nix flake check         build + smoke-test the Cargo wrapper"
+              echo "  nix build .#snapwave-legacy  build the Fortran oracle via Nix"
             '';
           };
         }
