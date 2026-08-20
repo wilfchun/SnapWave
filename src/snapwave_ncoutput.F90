@@ -59,11 +59,44 @@ module snapwave_ncoutput
    type(map_type) :: map_file
    type(his_type) :: his_file
    !
+   ! plan.md Phase 7: capture mode. When enabled, the ncoutput_* entry
+   ! points write the exact buffers they would hand to nf90_put_var into a
+   ! stream file (capture_unit) instead of creating NetCDF files, so the
+   ! Rust wrapper can replay them through its own writer
+   ! (src_rust/output.rs). Off by default, so the legacy `make` build and
+   ! the `snapwave_run_c` facade path are unaffected.
+   !
+   logical :: capture_mode = .false.
+   integer :: capture_unit = -1
+   !
 contains
+   !
+   subroutine ncoutput_capture_begin(unit)
+      !
+      ! Enter capture mode: subsequent ncoutput_init/update_*/finalize calls
+      ! write to `unit` instead of NetCDF. The caller opens (and later
+      ! closes) the stream unit.
+      !
+      integer, intent(in) :: unit
+      capture_mode = .true.
+      capture_unit = unit
+      !
+   end subroutine
+   !
+   subroutine ncoutput_capture_end()
+      capture_mode = .false.
+      capture_unit = -1
+      !
+   end subroutine
    !
    subroutine ncoutput_init()
       !
       use snapwave_data
+      !
+      if (capture_mode) then
+         call ncoutput_capture_static()
+         return
+      end if
       !
       write (*, *) 'Initialize ncoutput'
       if (map_filename /= '') call ncoutput_map_init()
@@ -86,6 +119,8 @@ contains
    subroutine ncoutput_finalize()
       !
       use snapwave_data
+      !
+      if (capture_mode) return
       !
       if (map_filename /= '') call ncoutput_map_finalize()
       if (his_filename /= '') call ncoutput_his_finalize()
@@ -638,6 +673,11 @@ contains
       !
       integer :: ntmapout
       !
+      if (capture_mode) then
+         call ncoutput_capture_update_map(t, ntmapout)
+         return
+      end if
+      !
       NF90(nf90_put_var(map_file%ncid, map_file%time_varid, t, (/ntmapout/))) ! write time
       !
       if (map_dep == 1) then
@@ -765,6 +805,11 @@ contains
       implicit none
       real*8 :: t
       integer :: nthisout
+      !
+      if (capture_mode) then
+         call ncoutput_capture_update_his(t, nthisout)
+         return
+      end if
       !
       NF90(nf90_put_var(his_file%ncid, his_file%time_varid, t, (/nthisout/))) ! write time
       !
@@ -1058,5 +1103,273 @@ contains
       end if
 
    end subroutine directional_spreading
+
+   !*************************************************************************
+   ! plan.md Phase 7 capture helpers. The stream format is mirrored by
+   ! src_rust/capture.rs; keep the two in lock-step. All multi-byte values
+   ! are written natively (little-endian on the supported x86_64 platforms,
+   ! the same convention as the existing snapwave.upw file). Strings are
+   ! length-prefixed (u32 byte count, then the trimmed bytes).
+   !*************************************************************************
+   subroutine cap_write_int(u, v)
+      integer, intent(in) :: u, v
+      write (u) v
+   end subroutine cap_write_int
+
+   subroutine cap_write_str(u, s)
+      integer, intent(in) :: u
+      character(len=*), intent(in) :: s
+      integer :: n
+      n = len_trim(s)
+      write (u) n
+      write (u) s(1:n)
+   end subroutine cap_write_str
+
+   subroutine ncoutput_capture_static()
+      !
+      ! Write the header and the static map/history state.
+      !
+      use snapwave_data
+      implicit none
+      !
+      write (capture_unit) 'SWCA'
+      call cap_write_int(capture_unit, 1) ! format version
+      !
+      if (map_filename /= '') then
+         call cap_write_int(capture_unit, 1) ! TAG_STATIC_MAP
+         call ncoutput_capture_static_map()
+      end if
+      !
+      if (his_filename /= '' .and. nobs > 0) then
+         call cap_write_int(capture_unit, 2) ! TAG_STATIC_HIS
+         call ncoutput_capture_static_his()
+      end if
+      !
+   end subroutine ncoutput_capture_static
+
+   subroutine ncoutput_capture_static_map()
+      !
+      use snapwave_data
+      implicit none
+      !
+      call cap_write_int(capture_unit, no_nodes)
+      call cap_write_int(capture_unit, no_faces)
+      call cap_write_int(capture_unit, max_nodes)
+      call cap_write_int(capture_unit, ntheta)
+      call cap_write_int(capture_unit, sferic)
+      !
+      trefstr_iso8601 = date_to_iso8601(trefstr)
+      call cap_write_str(capture_unit, trefstr_iso8601)
+      call cap_write_str(capture_unit, trim(nf90_inq_libvers()))
+      !
+      write (capture_unit) x
+      write (capture_unit) y
+      write (capture_unit) zb
+      ! face_nodes(1:max_nodes,:) — the same section nf90_put_var would write.
+      write (capture_unit) face_nodes(1:max_nodes, :)
+      write (capture_unit) fw
+      write (capture_unit) fw_ig
+      ! Note: the directional grid `theta` is NOT captured here. At this
+      ! point (before the time loop) it is uninitialized — the Fortran
+      ! writer's init-time put of `theta` is overwritten by the first map
+      ! record, so the Rust writer uses each record's `theta_deg` instead.
+      !
+      call cap_write_int(capture_unit, ja_vegetation)
+      if (ja_vegetation == 1) then
+         write (capture_unit) veg_ah(:, 1)
+         write (capture_unit) veg_bstems(:, 1)
+         write (capture_unit) veg_Nstems(:, 1)
+      end if
+      !
+   end subroutine ncoutput_capture_static_map
+
+   subroutine ncoutput_capture_static_his()
+      !
+      use snapwave_data
+      implicit none
+      integer :: i
+      !
+      trefstr_iso8601 = date_to_iso8601(trefstr)
+      call cap_write_str(capture_unit, trefstr_iso8601)
+      call cap_write_str(capture_unit, trim(nf90_inq_libvers()))
+      !
+      call cap_write_int(capture_unit, nobs)
+      write (capture_unit) xobs
+      write (capture_unit) yobs
+      do i = 1, nobs
+         write (capture_unit) nameobs(i)
+      end do
+      !
+   end subroutine ncoutput_capture_static_his
+
+   subroutine ncoutput_capture_update_map(t, ntmapout)
+      !
+      ! Compute the same buffers ncoutput_update_map would write and stream
+      ! them to the capture file instead of NetCDF. Kept in lock-step with
+      ! ncoutput_update_map (plan.md Phase 7).
+      !
+      use snapwave_data
+      use snapwave_results
+      implicit none
+      !
+      real*8, intent(in) :: t
+      integer, intent(in) :: ntmapout
+      !
+      real*4 :: spread_deg
+      real*4, allocatable :: cbuf(:), cbuf1(:), cbuf2(:, :)
+      real*8, allocatable :: cos_theta(:), sin_theta(:)
+      integer :: itheta, k
+      !
+      ! `buf`/`buf1`/`buf2` are module globals in the NetCDF path (allocated
+      ! by ncoutput_map_init, which capture mode skips); here they are local
+      ! (`cbuf*`), so allocate them up front — some branches (e.g. map_dirspr)
+      ! only ever assign elements, never the whole array.
+      allocate (cbuf(no_nodes))
+      !
+      call cap_write_int(capture_unit, 3) ! TAG_MAP_RECORD
+      write (capture_unit) t
+      call cap_write_int(capture_unit, ntmapout)
+      !
+      if (map_dep == 1) then
+         cbuf = depth
+         write (capture_unit) cbuf
+      end if
+      !
+      if (map_Hm0 == 1) then
+         cbuf = H*sqrt(2.0)
+         write (capture_unit) cbuf
+      end if
+      !
+      if (ig == 1 .and. map_Hig == 1) then
+         cbuf = H_ig*sqrt(2.0)
+         where (depth < hmin) cbuf = FILL_VALUE
+         write (capture_unit) cbuf
+      end if
+      !
+      if (map_Tp == 1) then
+         cbuf = Tp
+         where (depth < hmin) cbuf = FILL_VALUE
+         write (capture_unit) cbuf
+      end if
+      !
+      if (map_dir == 1) then
+         cbuf = modulo(270 - thetam*rad2deg + 360., 360.)
+         where (depth < hmin) cbuf = FILL_VALUE
+         write (capture_unit) cbuf
+      end if
+      !
+      if (map_dirspr == 1) then
+         allocate (cos_theta(ntheta), sin_theta(ntheta))
+         do itheta = 1, ntheta
+            cos_theta(itheta) = cos(real(theta(itheta), kind(1.0d0)))
+            sin_theta(itheta) = sin(real(theta(itheta), kind(1.0d0)))
+         end do
+         do k = 1, no_nodes
+            call directional_spreading(ee(:, k), cos_theta, sin_theta, spread_deg)
+            cbuf(k) = spread_deg
+         end do
+         deallocate (cos_theta, sin_theta)
+         where (depth < hmin) cbuf = FILL_VALUE
+         write (capture_unit) cbuf
+      end if
+      !
+      if (map_cg == 1) then
+         cbuf = Cg
+         where (depth < hmin) cbuf = FILL_VALUE
+         write (capture_unit) cbuf
+      end if
+      !
+      if (map_Dw == 1) then
+         cbuf = Dw
+         where (depth < hmin) cbuf = FILL_VALUE
+         write (capture_unit) cbuf
+      end if
+      !
+      if (map_Df == 1) then
+         cbuf = Df
+         where (depth < hmin) cbuf = FILL_VALUE
+         write (capture_unit) cbuf
+      end if
+      !
+      if (wind == 1 .and. map_SwE == 1) then
+         cbuf = SwE
+         where (depth < hmin) cbuf = FILL_VALUE
+         write (capture_unit) cbuf
+      end if
+      !
+      if (wind == 1 .and. map_SwA == 1) then
+         cbuf = SwA
+         where (depth < hmin) cbuf = FILL_VALUE
+         write (capture_unit) cbuf
+      end if
+      !
+      if (wind == 1 .and. map_sig == 1) then
+         cbuf = sig
+         where (depth < hmin) cbuf = FILL_VALUE
+         write (capture_unit) cbuf
+      end if
+      !
+      if (wind == 1 .and. map_u10 == 1) then
+         cbuf = u10
+         where (depth < hmin) cbuf = FILL_VALUE
+         write (capture_unit) cbuf
+         !
+         cbuf = modulo(270 - u10dir*rad2deg + 360., 360.)
+         where (depth < hmin) cbuf = FILL_VALUE
+         write (capture_unit) cbuf
+      end if
+      !
+      if (ja_vegetation == 1 .and. map_Dveg == 1) then
+         cbuf = Dveg
+         where (depth < hmin) cbuf = FILL_VALUE
+         write (capture_unit) cbuf
+      end if
+      !
+      if (map_ee == 1) then
+         cbuf2 = ee
+         write (capture_unit) cbuf2
+      end if
+      !
+      if (map_ctheta == 1) then
+         cbuf2 = ctheta
+         write (capture_unit) cbuf2
+      end if
+      !
+      if (map_ee == 1 .or. map_ctheta == 1) then
+         cbuf1 = modulo(270 - theta*rad2deg, 360.)
+         write (capture_unit) cbuf1
+      end if
+      !
+   end subroutine ncoutput_capture_update_map
+
+   subroutine ncoutput_capture_update_his(t, nthisout)
+      !
+      ! Stream the observation-point buffers ncoutput_update_his would
+      ! write (plan.md Phase 7).
+      !
+      use snapwave_data
+      implicit none
+      !
+      real*8, intent(in) :: t
+      integer, intent(in) :: nthisout
+      !
+      call cap_write_int(capture_unit, 4) ! TAG_HIS_RECORD
+      write (capture_unit) t
+      call cap_write_int(capture_unit, nthisout)
+      !
+      write (capture_unit) zsobs
+      write (capture_unit) hm0obs
+      write (capture_unit) tpobs
+      write (capture_unit) wdobs
+      write (capture_unit) dirsprobs
+      if (ig == 1) write (capture_unit) hm0igobs
+      write (capture_unit) dwobs
+      write (capture_unit) dfobs
+      if (wind == 1) then
+         write (capture_unit) swobs
+         write (capture_unit) stobs
+      end if
+      !
+   end subroutine ncoutput_capture_update_his
 
 end module

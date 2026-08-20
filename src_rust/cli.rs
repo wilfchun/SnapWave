@@ -44,6 +44,10 @@ pub enum Invocation {
     /// Fortran readers through the temporary Phase 6 hook, and exit
     /// without running the model (plan.md Phase 6, step 2).
     CompareText(RunCommand),
+    /// Read the mesh NetCDF in Rust, compare against the unchanged Fortran
+    /// `nc_read_net` reader through the temporary Phase 7 hook, and exit
+    /// without running the model (plan.md Phase 7, step 2).
+    CompareMesh(RunCommand),
 }
 
 /// A requested model run, still unvalidated: input validation happens when
@@ -68,6 +72,7 @@ pub fn parse(args: &[OsString]) -> Result<Invocation, String> {
     let mut verbose = false;
     let mut compare_input = false;
     let mut compare_text = false;
+    let mut compare_mesh = false;
     let mut only_positional = false;
 
     for arg in args.iter().skip(1) {
@@ -87,6 +92,7 @@ pub fn parse(args: &[OsString]) -> Result<Invocation, String> {
             (true, Some("-v")) | (true, Some("--verbose")) => verbose = true,
             (true, Some("--compare-input")) => compare_input = true,
             (true, Some("--compare-text")) => compare_text = true,
+            (true, Some("--compare-mesh")) => compare_mesh = true,
             (true, Some(other)) => return Err(format!("unknown option: {other}")),
             (true, None) => {
                 return Err(format!("unknown option: {}", arg.to_string_lossy()));
@@ -103,6 +109,7 @@ pub fn parse(args: &[OsString]) -> Result<Invocation, String> {
     match input {
         Some(input) if compare_input => Ok(Invocation::CompareInput(command(input))),
         Some(input) if compare_text => Ok(Invocation::CompareText(command(input))),
+        Some(input) if compare_mesh => Ok(Invocation::CompareMesh(command(input))),
         Some(input) => Ok(Invocation::Run(command(input))),
         None => Err(format!("missing input path (expected one {INPUT_FILE_HINT} file)")),
     }
@@ -147,6 +154,9 @@ Options:
                    boundary, wind, enclosure/neumann) in Rust and compare
                    against the Fortran readers, then exit without running
                    the model (plan.md Phase 6)
+  --compare-mesh   Read the mesh NetCDF (gridfile) in Rust and compare
+                   against the unchanged Fortran nc_read_net reader, then
+                   exit without running the model (plan.md Phase 7)
   -h, --help     Print this help and exit
   -V, --version  Print version information and exit
 
@@ -262,6 +272,21 @@ mod tests {
         let err = parse(&args(&["--compare-text"])).expect_err("input path still required");
         assert!(err.contains("missing input"), "error was: {err}");
         assert!(help_text("snapwave").contains("--compare-text"));
+    }
+
+    #[test]
+    fn compare_mesh_flag_is_parsed() {
+        match parse(&args(&["--compare-mesh", "SnapWave.inp"])) {
+            Ok(Invocation::CompareMesh(cmd)) => {
+                assert_eq!(cmd.input, PathBuf::from("SnapWave.inp"));
+                assert!(!cmd.verbose);
+            }
+            other => panic!("expected a compare-mesh invocation, got {other:?}"),
+        }
+        // Still needs the positional input path.
+        let err = parse(&args(&["--compare-mesh"])).expect_err("input path still required");
+        assert!(err.contains("missing input"), "error was: {err}");
+        assert!(help_text("snapwave").contains("--compare-mesh"));
     }
 
     #[test]

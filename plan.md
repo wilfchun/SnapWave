@@ -383,6 +383,39 @@ Acceptance:
   tolerance.
 - NetCDF errors are surfaced as Rust errors with filename and operation context.
 
+Status: implemented (2026-08-20). The NetCDF strategy (step 1) is a
+hand-rolled classic-format (CDF-1) writer + reader in `src_rust/netcdf.rs`,
+chosen over bindings to the installed library to keep the build
+dependency-free under Nix and identical on every toolchain — the same
+reason the read side was hand-rolled in Phase 1 (`tests/support/ncdf.rs`);
+the rationale is documented in the module docs. Step 2 ports `nc_read_net`
+into `src_rust/mesh.rs` (`read_ugrid_netcdf`: old/new dimension-name
+detection, coordinate widening to real*8, `zb = -posdwn*zb`, the
+`-1 -> 0 -> -999` fourth-node chain, and the `|y(1)|>90` sferic fix) and
+pins it against the unchanged Fortran reader through the temporary
+`snapwave_mesh_dump_c` hook, driven by the wrapper's `--compare-mesh` mode
+and `tests/netcdf_io.rs`. Steps 3–6 switch output writing to Rust:
+`snapwave_ncoutput` gains a capture mode (off by default, so the legacy
+`make` oracle and the retained `snapwave_run_c` facade path are unaffected)
+that streams the exact buffers `nf90_put_var` would receive into a
+little-endian stream file; the wrapper runs the model through the new
+`snapwave_run_capture_c` facade, reads the stream (`src_rust/capture.rs`)
+and writes map/history with `src_rust/output.rs`, reproducing the Fortran
+schema (dimension/variable names, attribute strings, fill values, ordering,
+time indexing) verbatim — including the per-solver-iteration map output of
+`ja_save_each_iter`, because the capture intercepts `ncoutput_update_map`
+itself. Values Fortran never writes (`mesh2d`, `crs`, `station_id`,
+`point_zb`, `total_runtime`, `average_dt`) are emitted with the NetCDF
+default fill values. Acceptance is pinned by the existing regression suite:
+the wrapper's map/history files are now Rust-written and
+`tests/regression.rs` compares them against the committed baselines and the
+live Fortran oracle, while `tests/mwe.rs` and the flake smoke test keep the
+structural (`ncdump -h`) checks. NetCDF errors surface as Rust errors with
+filename and operation context (`anyhow` context in `netcdf.rs`/`output.rs`).
+The Fortran mesh readers remain the runtime authority inside a model run —
+handing Rust-owned mesh data to Fortran is the Phase 8 data-structure
+handoff.
+
 ## Phase 8: Rust Domain And Mesh Data Structures
 
 Goal: replace the global Fortran data module with explicit Rust state for

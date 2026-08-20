@@ -22,9 +22,13 @@ plan.md Phases 1 (test oracle and baselines), 2 (Rust CLI and run
 context), 3 (`SnapWave.inp` parsing in Rust, validated against the
 Fortran reader through the temporary `--compare-input` hook), 4 (config
 defaults, validation, and diagnostics), 5 (filesystem and output
-directory handling in Rust) and 6 (auxiliary text input readers, validated
+directory handling in Rust), 6 (auxiliary text input readers, validated
 against the Fortran readers through the temporary `--compare-text` hook)
-are done. Phase 7 (NetCDF input and output) is the active frontier.
+and 7 (NetCDF input and output: a hand-rolled classic-format writer/reader,
+a Rust `nc_read_net` port validated through the `--compare-mesh` hook, and
+Rust-owned map/history output written from a Fortran state capture stream)
+are done. Phase 8 (Rust domain and mesh data structures) is the active
+frontier.
 
 ## Non-negotiable rules
 

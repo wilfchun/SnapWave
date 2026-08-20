@@ -112,9 +112,8 @@ impl RunContext {
             .with_context(|| format!("failed to change working directory to {}", self.run_dir.display()))
     }
 
-    /// The input file name as a C string for the FFI facade
-    /// (`snapwave_run_c`, see `src/snapwave_c_api.f90`; explicit length, no
-    /// NUL termination).
+    /// The input file name as a C string for the FFI facade (see
+    /// `src/snapwave_c_api.f90`; explicit length, no NUL termination).
     ///
     /// On Unix the raw OS bytes are used (file names need not be valid
     /// UTF-8); other platforms require valid Unicode for the conversion.

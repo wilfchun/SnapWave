@@ -16,6 +16,7 @@ build internals.
 | `input_validate.rs` | Phase-4 validation: bad intervals, optional output settings, missing input file, resolved-config handoff |
 | `output_dirs.rs` | Phase-5 filesystem tests: nested run directories, wrapper-created output parents, disabled map/history output |
 | `text_input.rs` | Phase-6 text-reader tests: `--compare-text` parity against the Fortran readers on checked-in cases |
+| `netcdf_io.rs` | Phase-7 NetCDF tests: `--compare-mesh` parity against the Fortran `nc_read_net` reader on checked-in meshes |
 | `ncdf_parser.rs` | Self-tests of the NetCDF reader against committed fixtures (no model run) |
 | `support/ncdf.rs` | Dependency-free reader for NetCDF classic (CDF-1/CDF-2) files |
 | `support/harness.rs` | Testcase copying, separator normalization, wrapper/oracle execution |
@@ -88,6 +89,29 @@ list-directed quirks (blank-line skipping, quoted-literal handling, the
 `src_rust/text_input.rs`, which also unit-tests the multi-point time series,
 the wind list, and the plain-text mesh/sample readers (family 6, no checked-in
 coverage yet).
+
+## NetCDF input and output (Phase 7)
+
+`netcdf_io.rs` exercises the Phase-7 comparison hook through the wrapper's
+`--compare-mesh` mode: the Rust `nc_read_net` port (`src_rust/mesh.rs`)
+reads the same UGRID mesh NetCDF file as the unchanged Fortran reader, and
+every resulting global must agree (coordinates as exact IEEE-754 real*8 bit
+patterns, `zb`/`msk`/`face_nodes` exact). Like `--compare-text` this needs
+the mesh, so the checked-in cases are copied to a temp dir (separators
+normalized in the copy) and the hook runs `read_resolved_input` +
+`nc_read_net` + the two domain post-processing steps before dumping.
+
+Map/history output writing (steps 3–6) is pinned by the existing regression
+suite: since Phase 7 the wrapper writes those files itself (Fortran runs in
+capture mode — `snapwave_run_capture_c` streams the output-time buffers to
+a temp file — and `src_rust/output.rs` replays them into NetCDF), so
+`tests/regression.rs` compares the Rust-written files against the committed
+baselines and the live Fortran oracle, and `tests/mwe.rs`/the flake smoke
+test keep the `ncdump -h` structural checks. The writer reproduces the
+Fortran schema (dimensions, variable names, attribute strings, fill values,
+ordering and time indexing) and fills the variables SnapWave never writes
+(`mesh2d`, `crs`, `station_id`, `point_zb`, `total_runtime`, `average_dt`)
+with the NetCDF default fill values.
 
 ## Output-directory handling (Phase 5)
 

@@ -43,9 +43,6 @@ contains
 
       character(len=:), allocatable :: ftext
       character(kind=c_char), dimension(:), pointer :: cchars
-      real*8  :: t
-      real*8  :: output_tol
-      integer :: it
       integer :: i
       integer :: du
       integer :: ios
@@ -87,6 +84,106 @@ contains
       call ncoutput_init()
       !
       ! Start time loop
+      !
+      call run_time_loop()
+      !
+      call ncoutput_finalize()
+      !
+      status = 0_c_int
+      !
+    end function snapwave_run_c
+
+   !************************************************************************
+   ! plan.md Phase 7: run the model without NetCDF output, streaming the
+   ! output-time state to a capture file that the Rust wrapper replays
+   ! through its own NetCDF writers (src_rust/output.rs). Shares the
+   ! timestep loop with snapwave_run_c via run_time_loop; only the output
+   ! sink differs (capture stream vs NetCDF).
+   !************************************************************************
+   function snapwave_run_capture_c(config, config_len, capture_path, capture_path_len) &
+         bind(C, name="snapwave_run_capture_c") result(status)
+      use snapwave_data
+      use snapwave_input
+      use snapwave_domain
+      use snapwave_boundaries
+      use snapwave_ncoutput
+      use snapwave_obspoints
+      implicit none
+
+      type(c_ptr), value :: config
+      integer(c_int), value :: config_len
+      type(c_ptr), value :: capture_path
+      integer(c_int), value :: capture_path_len
+      integer(c_int) :: status
+
+      character(len=:), allocatable :: ftext
+      character(len=1024) :: cpath
+      character(kind=c_char), dimension(:), pointer :: cchars
+      integer :: i, du, ios, cu
+
+      status = 1_c_int
+
+      allocate (character(len=config_len) :: ftext)
+      call c_f_pointer(config, cchars, [config_len])
+      do i = 1, config_len
+         ftext(i:i) = achar(iachar(cchars(i)))
+      end do
+      call c_f_pointer(capture_path, cchars, [capture_path_len])
+      cpath = ' '
+      do i = 1, capture_path_len
+         cpath(i:i) = achar(iachar(cchars(i)))
+      end do
+
+      open (newunit=du, status='scratch', action='readwrite', iostat=ios)
+      if (ios /= 0) then
+         write (*, *) 'ERROR: snapwave_run_capture_c: cannot open scratch file for config'
+         return
+      end if
+      call write_config_lines(du, ftext)
+      call read_resolved_input(du)
+      close (du)
+
+      call initialize_snapwave_domain()
+      call read_obs_points()
+      call read_boundary_data()
+      call read_wind_data()
+
+      open (newunit=cu, file=trim(cpath), form='unformatted', access='stream', &
+            action='write', status='replace', iostat=ios)
+      if (ios /= 0) then
+         write (*, *) 'ERROR: snapwave_run_capture_c: cannot open capture file: ', trim(cpath)
+         return
+      end if
+
+      call ncoutput_capture_begin(cu)
+      call ncoutput_init()
+      call run_time_loop()
+      call ncoutput_finalize()
+      call ncoutput_capture_end()
+
+      close (cu)
+      status = 0_c_int
+      !
+   end function snapwave_run_capture_c
+
+   subroutine run_time_loop()
+      !
+      ! Timestep loop shared by snapwave_run_c (NetCDF output) and
+      ! snapwave_run_capture_c (Phase 7 capture output). The model stepping
+      ! and the output scheduling are identical; the two facades differ only
+      ! in how ncoutput_* handles each output time.
+      !
+      use snapwave_data
+      use snapwave_boundaries
+      use snapwave_solver
+      use snapwave_ncoutput
+      use snapwave_obspoints
+      use omp_lib
+      implicit none
+      !
+      real*8  :: t
+      real*8  :: output_tol
+      integer :: it
       !
       !$omp parallel
       !$omp single
@@ -133,11 +230,116 @@ contains
          !
       enddo
       !
-       call ncoutput_finalize()
-       !
-       status = 0_c_int
-       !
-    end function snapwave_run_c
+   end subroutine run_time_loop
+
+   !************************************************************************
+   ! plan.md Phase 7 step 2 hook: read the mesh NetCDF with the unchanged
+   ! nc_read_net reader (plus the two initialize_snapwave_domain
+   ! post-processing steps) and dump the resulting globals, so the Rust port
+   ! (src_rust/mesh.rs) can be pinned against the numerical oracle.
+   !************************************************************************
+   function snapwave_mesh_dump_c(config, config_len, dump_path, dump_path_len) &
+         bind(C, name="snapwave_mesh_dump_c") result(status)
+      use snapwave_data
+      use snapwave_input
+      use snapwave_ncoutput, only: nc_read_net
+      implicit none
+
+      type(c_ptr), value :: config
+      integer(c_int), value :: config_len
+      type(c_ptr), value :: dump_path
+      integer(c_int), value :: dump_path_len
+      integer(c_int) :: status
+
+      character(len=:), allocatable :: ftext
+      character(len=1024) :: dpath
+      character(kind=c_char), dimension(:), pointer :: cchars
+      integer :: i, ios, dunit, du, k
+
+      status = 1_c_int
+
+      allocate (character(len=config_len) :: ftext)
+      call c_f_pointer(config, cchars, [config_len])
+      do i = 1, config_len
+         ftext(i:i) = achar(iachar(cchars(i)))
+      end do
+      call c_f_pointer(dump_path, cchars, [dump_path_len])
+      dpath = ' '
+      do i = 1, dump_path_len
+         dpath(i:i) = achar(iachar(cchars(i)))
+      end do
+
+      open (newunit=du, status='scratch', action='readwrite', iostat=ios)
+      if (ios /= 0) then
+         write (*, *) 'ERROR: snapwave_mesh_dump_c: cannot open scratch file for config'
+         return
+      end if
+      call write_config_lines(du, ftext)
+      call read_resolved_input(du)
+      close (du)
+
+      ! Read the mesh, then reproduce the two initialize_snapwave_domain
+      ! post-processing steps (zb sign flip, fourth-node sentinel).
+      call nc_read_net()
+      zb = -posdwn*zb
+      do k = 1, no_faces
+         if (face_nodes(4, k) == 0) face_nodes(4, k) = -999
+      end do
+
+      open (newunit=dunit, file=trim(dpath), status='replace', action='write', iostat=ios)
+      if (ios /= 0) then
+         write (*, *) 'ERROR: snapwave_mesh_dump_c: cannot open dump file: ', trim(dpath)
+         return
+      end if
+
+      call dump_mesh_globals(dunit)
+      close (dunit)
+      !
+      status = 0_c_int
+      !
+   end function snapwave_mesh_dump_c
+
+   subroutine dump_mesh_globals(u)
+      !
+      ! Dump the mesh globals produced by nc_read_net + post-processing, in
+      ! the flat format parsed by src_rust/mesh.rs. face_nodes is dumped for
+      ! rows 1..max_nodes only (the deterministic part; for a pure-triangle
+      ! mesh the fourth row is never written).
+      !
+      use snapwave_data
+      implicit none
+      integer, intent(in) :: u
+      integer :: k, j
+      !
+      write (u, '(A,1X,I0)') 'no_nodes', no_nodes
+      write (u, '(A,1X,I0)') 'no_faces', no_faces
+      write (u, '(A,1X,I0)') 'max_nodes', max_nodes
+      write (u, '(A,1X,I0)') 'sferic', sferic
+      !
+      write (u, '(A,1X,I0)') 'x', no_nodes
+      do k = 1, no_nodes
+         call dump_r8_line(u, x(k))
+      end do
+      write (u, '(A,1X,I0)') 'y', no_nodes
+      do k = 1, no_nodes
+         call dump_r8_line(u, y(k))
+      end do
+      write (u, '(A,1X,I0)') 'zb', no_nodes
+      do k = 1, no_nodes
+         call dump_r4_line(u, zb(k))
+      end do
+      write (u, '(A,1X,I0)') 'msk', no_nodes
+      do k = 1, no_nodes
+         write (u, '(I0)') msk(k)
+      end do
+      write (u, '(A,1X,I0)') 'face_nodes', max_nodes*no_faces
+      do k = 1, no_faces
+         do j = 1, max_nodes
+            write (u, '(I0)') face_nodes(j, k)
+         end do
+      end do
+      !
+   end subroutine dump_mesh_globals
 
    !************************************************************************
    ! Comparison hooks (plan.md Phase 3 step 5 and Phase 4).

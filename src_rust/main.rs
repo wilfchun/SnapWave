@@ -36,14 +36,25 @@
 //! unchanged Fortran readers through the temporary `snapwave_text_dump_c`
 //! hook (`text_compare`).
 //!
+//! Phase 7 (plan.md): NetCDF input and output are Rust-owned. The mesh
+//! reader (`mesh`, a port of `nc_read_net`) is pinned against the Fortran
+//! oracle through `--compare-mesh`; the run path drives Fortran in capture
+//! mode (`snapwave_run_capture_c` streams the output-time state to a temp
+//! file) and the Rust writers (`output`, built on the hand-rolled classic
+//! NetCDF writer in `netcdf`) write the map/history files.
+//!
 //! Status codes: 0 on success (including `--help`/`--version`), 2 on
 //! wrapper-detected errors, and any non-zero Fortran status is passed
 //! through unchanged.
 
+mod capture;
 mod cli;
 mod diagnostics;
 mod input;
 mod input_compare;
+mod mesh;
+mod netcdf;
+mod output;
 mod paths;
 mod run_context;
 mod text_compare;
@@ -61,10 +72,15 @@ use run_context::{path_to_cstring, ExeMeta, LogPrefs, RunContext};
 // FFI boundary (AGENTS.md): signatures must match src/snapwave_c_api.f90
 // exactly (`bind(C)`; explicit length, no reliance on NUL termination).
 extern "C" {
-    // plan.md Phase 4: the facade now receives the fully-resolved
-    // configuration as canonical key=value text (Rust is the authority
-    // for defaults, validation and post-processing).
-    fn snapwave_run_c(config: *const c_char, config_len: c_int) -> c_int;
+    // plan.md Phase 7: run the model in capture mode — Fortran streams the
+    // output-time state to `capture_path` instead of writing NetCDF, and the
+    // Rust writer (src_rust/output.rs) replays it into the real files.
+    fn snapwave_run_capture_c(
+        config: *const c_char,
+        config_len: c_int,
+        capture_path: *const c_char,
+        capture_path_len: c_int,
+    ) -> c_int;
 
     // Phase 3 comparison hook: parse the input file with the legacy
     // Fortran reader and dump the resulting globals.
@@ -88,6 +104,16 @@ extern "C" {
     // unchanged Fortran readers and dump the resulting globals, pinning the
     // Rust parsers in `text_input` against the numerical oracle.
     fn snapwave_text_dump_c(
+        config: *const c_char,
+        config_len: c_int,
+        dump_path: *const c_char,
+        dump_path_len: c_int,
+    ) -> c_int;
+
+    // Phase 7 step 2 comparison hook: read the mesh NetCDF with the
+    // unchanged nc_read_net reader and dump the resulting globals, pinning
+    // the Rust mesh reader in `mesh` against the numerical oracle.
+    fn snapwave_mesh_dump_c(
         config: *const c_char,
         config_len: c_int,
         dump_path: *const c_char,
@@ -120,6 +146,13 @@ fn main() {
             }
         },
         Ok(Invocation::CompareText(cmd)) => match compare_text_with_fortran(cmd, exe) {
+            Ok(status) => status,
+            Err(err) => {
+                eprintln!("error: {err:#}");
+                EXIT_USAGE
+            }
+        },
+        Ok(Invocation::CompareMesh(cmd)) => match compare_mesh_with_fortran(cmd, exe) {
             Ok(status) => status,
             Err(err) => {
                 eprintln!("error: {err:#}");
@@ -186,17 +219,53 @@ fn execute(cmd: cli::RunCommand, exe: ExeMeta) -> Result<i32> {
     let text = config.to_config_text();
     let c_text = std::ffi::CString::new(text)
         .with_context(|| "config text contains an embedded NUL byte")?;
-    let config_len = c_text.as_bytes().len() as c_int;
+
+    // plan.md Phase 7: run the model in capture mode. Fortran streams the
+    // output-time state to a temp file (instead of writing NetCDF) and the
+    // Rust writers below replay it into the real map/history files.
+    let capture_path =
+        std::env::temp_dir().join(format!("snapwave-capture-{}.bin", std::process::id()));
+    let c_capture = path_to_cstring(&capture_path)?;
+    // The facade buffers file paths as character(len=1024).
+    if c_capture.as_bytes().len() > 1024 {
+        bail!("capture path is too long for the FFI facade (>1024 bytes)");
+    }
 
     // Legacy chdir contract — isolated in RunContext until the plan.md
-    // Phase 6-7 readers accept explicit paths.
+    // Phase 8 mesh/data readers accept explicit paths.
     ctx.enter_run_dir()?;
 
-    let status = unsafe { snapwave_run_c(c_text.as_ptr(), config_len) };
+    let status = unsafe {
+        snapwave_run_capture_c(
+            c_text.as_ptr(),
+            c_text.as_bytes().len() as c_int,
+            c_capture.as_ptr(),
+            c_capture.as_bytes().len() as c_int,
+        )
+    };
 
-    // Preserve the Fortran exit status semantics: non-zero status fails
-    // the process with the same code.
-    Ok(status)
+    // Preserve the Fortran exit status semantics: a non-zero status fails
+    // the process with the same code, and no output is written.
+    if status != 0 {
+        let _ = std::fs::remove_file(&capture_path);
+        return Ok(status);
+    }
+
+    let capture = capture::read_capture(&capture_path, &config)?;
+    let _ = std::fs::remove_file(&capture_path);
+
+    if let Some(sm) = &capture.static_map {
+        if let Some(map_path) = &run_paths.outputs.map {
+            output::write_map(map_path, &config, sm, &capture.map_records)?;
+        }
+    }
+    if let Some(sh) = &capture.static_his {
+        if let Some(his_path) = &run_paths.outputs.his {
+            output::write_his(his_path, &config, sh, &capture.his_records)?;
+        }
+    }
+
+    Ok(0)
 }
 
 /// `--compare-input`: parse the input in Rust, run the legacy Fortran
@@ -345,6 +414,70 @@ fn compare_text_with_fortran(cmd: cli::RunCommand, exe: ExeMeta) -> Result<i32> 
 
     if ctx.log.verbose {
         eprintln!("text inputs: Rust parse matches the Fortran globals ({count} values compared)");
+    }
+    Ok(0)
+}
+
+/// `--compare-mesh`: read the mesh NetCDF in Rust, run the unchanged
+/// Fortran `nc_read_net` reader through the temporary Phase 7 hook, and
+/// compare the resulting globals. Exits 0 on agreement, without running the
+/// model (plan.md Phase 7, step 2).
+fn compare_mesh_with_fortran(cmd: cli::RunCommand, exe: ExeMeta) -> Result<i32> {
+    let ctx = RunContext::new(cmd.input, exe, LogPrefs { verbose: cmd.verbose })?;
+    let config = input::parse_file(&ctx.input_path)?;
+    let run_paths = paths::RunPaths::resolve(&ctx.run_dir, &config);
+
+    let gridfile = run_paths
+        .gridfile
+        .as_ref()
+        .context("mesh comparison requires a gridfile")?;
+    let rust_mesh = mesh::read_ugrid_netcdf(gridfile, config.grid.posdwn, config.grid.sferic)?;
+    if ctx.log.verbose {
+        eprintln!(
+            "mesh: read {} nodes, {} faces (max {} nodes/face) in Rust",
+            rust_mesh.no_nodes, rust_mesh.no_faces, rust_mesh.max_nodes
+        );
+    }
+
+    // The Fortran hook reads the gridfile (and any sibling inputs) relative
+    // to the run directory (same chdir contract as a real run).
+    ctx.enter_run_dir()?;
+
+    let text = config.to_config_text();
+    let c_text = std::ffi::CString::new(text)
+        .with_context(|| "config text contains an embedded NUL byte")?;
+
+    let dump_path =
+        std::env::temp_dir().join(format!("snapwave-mesh-dump-{}.txt", std::process::id()));
+    let c_dump = path_to_cstring(&dump_path)?;
+    // The facade buffers file paths as character(len=1024).
+    if c_dump.as_bytes().len() > 1024 {
+        bail!("dump path is too long for the FFI facade (>1024 bytes)");
+    }
+
+    let status = unsafe {
+        snapwave_mesh_dump_c(
+            c_text.as_ptr(),
+            c_text.as_bytes().len() as c_int,
+            c_dump.as_ptr(),
+            c_dump.as_bytes().len() as c_int,
+        )
+    };
+    if status != 0 {
+        let _ = std::fs::remove_file(&dump_path);
+        bail!("the Fortran mesh reader (nc_read_net) failed with status {status}");
+    }
+
+    let dump_text = std::fs::read_to_string(&dump_path)
+        .with_context(|| format!("reading the Fortran mesh dump at {}", dump_path.display()))?;
+    let _ = std::fs::remove_file(&dump_path);
+
+    let count = mesh::check(&rust_mesh, &dump_text).with_context(|| {
+        format!("comparing the Rust and Fortran mesh reads of {}", gridfile.display())
+    })?;
+
+    if ctx.log.verbose {
+        eprintln!("mesh: Rust read matches the Fortran nc_read_net ({count} values compared)");
     }
     Ok(0)
 }
