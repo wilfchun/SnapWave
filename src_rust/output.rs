@@ -11,10 +11,12 @@
 //! including the `where (depth < hmin)` fill masking and the
 //! `modulo(270 - …*rad2deg, 360.)` direction wrapping, is captured verbatim
 //! rather than recomputed here (keeping Fortran the numerical authority,
-//! AGENTS.md rule 1). Values the Fortran writer *never* writes (`mesh2d`,
-//! `crs`, `station_id`, `point_zb`, `total_runtime`, `average_dt`) are
-//! emitted with the NetCDF default fill values, matching what the C library
-//! leaves behind.
+//! AGENTS.md rule 1). Values the Fortran writer *never* writes are emitted
+//! exactly as netCDF would leave them: variables with no `_FillValue`
+//! attribute (`mesh2d`, `crs`, `station_id`, `total_runtime`, `average_dt`)
+//! carry the library default fill value, while `point_zb` — which Fortran
+//! defines with `_FillValue = FILL_VALUE` — carries SnapWave's `FILL_VALUE`
+//! (-999999.0).
 
 use std::path::Path;
 
@@ -91,7 +93,10 @@ pub fn write_map(path: &Path, cfg: &SnapWaveInput, sm: &StaticMap, recs: &[MapRe
     let ntheta = w.dim("ntheta", Some(sm.ntheta as u64));
     let time = w.dim("time", None);
 
-    w.global_attr(Attr::text("Conventions", "Conventions = 'CF-1.6, SGRID-0.3'"));
+    // The Fortran writer's string has an opening quote but no closing quote
+    // (a literal typo in ncoutput_map_init); reproduced verbatim so the
+    // Rust-written file matches the oracle byte-for-byte.
+    w.global_attr(Attr::text("Conventions", "Conventions = 'CF-1.6, SGRID-0.3"));
     w.global_attr(Attr::text("Build-Revision-Date-Netcdf-library", &sm.libvers));
     w.global_attr(Attr::text("Producer", "SnapWave"));
     w.global_attr(Attr::text("title", "SnapWave map netcdf output"));
@@ -469,7 +474,8 @@ pub fn write_his(path: &Path, cfg: &SnapWaveInput, sh: &StaticHis, recs: &[HisRe
     let namelen = w.dim("pointnamelength", Some(256));
     let runtime = w.dim("runtime", Some(1));
 
-    w.global_attr(Attr::text("Conventions", "Conventions = 'CF-1.6, SGRID-0.3'"));
+    // Same typo as the map writer: opening quote, no closing quote.
+    w.global_attr(Attr::text("Conventions", "Conventions = 'CF-1.6, SGRID-0.3"));
     w.global_attr(Attr::text("Build-Revision-Date-Netcdf-library", &sh.libvers));
     w.global_attr(Attr::text("Producer", "SnapWave"));
     w.global_attr(Attr::text("title", "Snapwave his point netcdf output"));
@@ -525,7 +531,9 @@ pub fn write_his(path: &Path, cfg: &SnapWaveInput, sh: &StaticHis, recs: &[HisRe
         data: VarData::Fixed(i32_single(NC_FILL_INT)),
     });
 
-    // point_zb (never written)
+    // point_zb has _FillValue = FILL_VALUE and is never written by Fortran,
+    // so netCDF pre-fills it with FILL_VALUE (-999999.0) — NOT the default
+    // float fill value.
     w.var(Var {
         name: "point_zb".into(),
         dims: vec![stations],
@@ -536,7 +544,7 @@ pub fn write_his(path: &Path, cfg: &SnapWaveInput, sh: &StaticHis, recs: &[HisRe
             Attr::text("standard_name", "altitude"),
             Attr::text("long_name", "bed_level_above_reference_level"),
         ],
-        data: VarData::Fixed(f32_payload(&vec![NC_FILL_FLOAT; sh.nobs])),
+        data: VarData::Fixed(f32_payload(&vec![FILL_VALUE; sh.nobs])),
     });
 
     let units = format!("seconds since {}", sh.tref_iso8601);
