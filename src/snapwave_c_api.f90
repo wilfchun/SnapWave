@@ -420,11 +420,269 @@ contains
       write (u, '(A,"=",I1)') trim(key), merge(1, 0, val)
    end subroutine dump_log
 
-   subroutine dump_char(u, key, val)
-      !
-      integer, intent(in) :: u
-      character(len=*), intent(in) :: key
-      character(len=*), intent(in) :: val
-      write (u, '(A,"=",A)') trim(key), trim(val)
-   end subroutine dump_char
+    subroutine dump_char(u, key, val)
+       !
+       integer, intent(in) :: u
+       character(len=*), intent(in) :: key
+       character(len=*), intent(in) :: val
+       write (u, '(A,"=",A)') trim(key), trim(val)
+    end subroutine dump_char
+
+    !************************************************************************
+    ! plan.md Phase 6 hook: read the auxiliary *text* inputs (observation
+    ! points, boundary conditions, wind, enclosure/neumann polylines) with
+    ! the unchanged Fortran readers and dump the resulting globals, so the
+    ! Rust parsers (src_rust/text_input.rs) can be pinned against the
+    ! numerical oracle. Mirrors snapwave_run_c up to read_wind_data but
+    ! stops before the NetCDF output and the time loop.
+    !
+    ! Dump format (parsed by src_rust/text_compare.rs):
+    !   "section <name>" then "key value" lines. Array keys (x, y, name, t,
+    !   hs, tp, wd, ds, zs, u10, u10dir) are followed by a count and then
+    !   one value per line: reals as IEEE-754 bit patterns in zero-padded
+    !   hex (real*8 Z16.16, real*4 Z8.8), names as trimmed text. Scalar keys
+    !   (n, mode, nwbnd, ntwbnd, ntu10bnd) carry a single value.
+    !************************************************************************
+    function snapwave_text_dump_c(config, config_len, dump_path, dump_path_len) &
+          bind(C, name="snapwave_text_dump_c") result(status)
+       use snapwave_data
+       use snapwave_input
+       use snapwave_domain
+       use snapwave_boundaries
+       use snapwave_obspoints
+       implicit none
+
+       type(c_ptr), value :: config
+       integer(c_int), value :: config_len
+       type(c_ptr), value :: dump_path
+       integer(c_int), value :: dump_path_len
+       integer(c_int) :: status
+
+       character(len=:), allocatable :: ftext
+       character(len=1024) :: dpath
+       character(kind=c_char), dimension(:), pointer :: cchars
+       integer :: i, ios, dunit, du
+
+       status = 1_c_int
+
+       allocate (character(len=config_len) :: ftext)
+       call c_f_pointer(config, cchars, [config_len])
+       do i = 1, config_len
+          ftext(i:i) = achar(iachar(cchars(i)))
+       end do
+       call c_f_pointer(dump_path, cchars, [dump_path_len])
+       dpath = ' '
+       do i = 1, dump_path_len
+          dpath(i:i) = achar(iachar(cchars(i)))
+       end do
+
+       open (newunit=du, status='scratch', action='readwrite', iostat=ios)
+       if (ios /= 0) then
+          write (*, *) 'ERROR: snapwave_text_dump_c: cannot open scratch file for config'
+          return
+       end if
+       call write_config_lines(du, ftext)
+       call read_resolved_input(du)
+       close (du)
+
+       ! Read mesh (and, inside it, the enclosure + Neumann polylines),
+       ! observation points, boundary conditions and wind — everything the
+       ! Phase 6 parsers mirror — but do not run the model.
+       call initialize_snapwave_domain()
+       call read_obs_points()
+       call read_boundary_data()
+       call read_wind_data()
+
+       open (newunit=dunit, file=trim(dpath), status='replace', action='write', iostat=ios)
+       if (ios /= 0) then
+          write (*, *) 'ERROR: snapwave_text_dump_c: cannot open dump file: ', trim(dpath)
+          return
+       end if
+
+       call dump_text_globals(dunit)
+
+       close (dunit)
+       !
+       status = 0_c_int
+       !
+    end function snapwave_text_dump_c
+
+    subroutine dump_text_globals(u)
+       !
+       ! Dump the snapwave_data globals produced by the auxiliary text
+       ! readers (obs points, boundary, wind, enclosure, neumann) in the
+       ! format described above. Keep the field order in lock-step with
+       ! src_rust/text_compare.rs.
+       !
+       use snapwave_data
+       implicit none
+       integer, intent(in) :: u
+       integer :: i, ib, itb
+
+       ! ---- observation points
+       write (u, '(A)') 'section obs'
+       write (u, '(A,1X,I0)') 'n', nobs
+       if (nobs > 0) then
+          write (u, '(A,1X,I0)') 'x', nobs
+          do i = 1, nobs
+             call dump_r8_line(u, xobs(i))
+          end do
+          write (u, '(A,1X,I0)') 'y', nobs
+          do i = 1, nobs
+             call dump_r8_line(u, yobs(i))
+          end do
+          write (u, '(A,1X,I0)') 'name', nobs
+          do i = 1, nobs
+             write (u, '(A)') trim(nameobs(i))
+          end do
+       end if
+
+       ! ---- boundary conditions
+       write (u, '(A)') 'section boundary'
+       if (len_trim(jonswapfile) > 0) then
+          ! Single-point JONSWAP file (read_boundary_data_singlepoint).
+          write (u, '(A)') 'mode single'
+          write (u, '(A,1X,I0)') 'nwbnd', nwbnd
+          write (u, '(A,1X,I0)') 'ntwbnd', ntwbnd
+          write (u, '(A,1X,I0)') 't', ntwbnd
+          do itb = 1, ntwbnd
+             call dump_r4_line(u, t_bwv(itb))
+          end do
+          write (u, '(A,1X,I0)') 'hs', ntwbnd
+          do itb = 1, ntwbnd
+             call dump_r4_line(u, hs_bwv(1, itb))
+          end do
+          write (u, '(A,1X,I0)') 'tp', ntwbnd
+          do itb = 1, ntwbnd
+             call dump_r4_line(u, tp_bwv(1, itb))
+          end do
+          write (u, '(A,1X,I0)') 'wd', ntwbnd
+          do itb = 1, ntwbnd
+             call dump_r4_line(u, wd_bwv(1, itb))
+          end do
+          write (u, '(A,1X,I0)') 'ds', ntwbnd
+          do itb = 1, ntwbnd
+             call dump_r4_line(u, ds_bwv(1, itb))
+          end do
+          write (u, '(A,1X,I0)') 'zs', ntwbnd
+          do itb = 1, ntwbnd
+             call dump_r4_line(u, zs_bwv(1, itb))
+          end do
+       else if (nwbnd > 0) then
+          ! Space- and time-varying files (read_boundary_data_timeseries).
+          write (u, '(A)') 'mode timeseries'
+          write (u, '(A,1X,I0)') 'nwbnd', nwbnd
+          write (u, '(A,1X,I0)') 'ntwbnd', ntwbnd
+          write (u, '(A,1X,I0)') 'x', nwbnd
+          do ib = 1, nwbnd
+             call dump_r8_line(u, x_bwv(ib))
+          end do
+          write (u, '(A,1X,I0)') 'y', nwbnd
+          do ib = 1, nwbnd
+             call dump_r8_line(u, y_bwv(ib))
+          end do
+          write (u, '(A,1X,I0)') 't', ntwbnd
+          do itb = 1, ntwbnd
+             call dump_r4_line(u, t_bwv(itb))
+          end do
+          write (u, '(A,1X,I0)') 'hs', nwbnd * ntwbnd
+          do itb = 1, ntwbnd
+             do ib = 1, nwbnd
+                call dump_r4_line(u, hs_bwv(ib, itb))
+             end do
+          end do
+          write (u, '(A,1X,I0)') 'tp', nwbnd * ntwbnd
+          do itb = 1, ntwbnd
+             do ib = 1, nwbnd
+                call dump_r4_line(u, tp_bwv(ib, itb))
+             end do
+          end do
+          write (u, '(A,1X,I0)') 'wd', nwbnd * ntwbnd
+          do itb = 1, ntwbnd
+             do ib = 1, nwbnd
+                call dump_r4_line(u, wd_bwv(ib, itb))
+             end do
+          end do
+          write (u, '(A,1X,I0)') 'ds', nwbnd * ntwbnd
+          do itb = 1, ntwbnd
+             do ib = 1, nwbnd
+                call dump_r4_line(u, ds_bwv(ib, itb))
+             end do
+          end do
+          write (u, '(A,1X,I0)') 'zs', nwbnd * ntwbnd
+          do itb = 1, ntwbnd
+             do ib = 1, nwbnd
+                call dump_r4_line(u, zs_bwv(ib, itb))
+             end do
+          end do
+       else
+          write (u, '(A)') 'mode none'
+       end if
+
+       ! ---- wind
+       write (u, '(A)') 'section wind'
+       write (u, '(A,1X,I0)') 'ntu10bnd', ntu10bnd
+       if (len_trim(windlistfile) > 0) then
+          write (u, '(A)') 'mode list'
+          write (u, '(A,1X,I0)') 't', ntu10bnd
+          do i = 1, ntu10bnd
+             call dump_r4_line(u, t_u10_bwv(i))
+          end do
+       else
+          write (u, '(A)') 'mode uniform'
+          write (u, '(A,1X,I0)') 'u10', 1
+          call dump_r4_line(u, u10_bwv(1, 1))
+          write (u, '(A,1X,I0)') 'u10dir', 1
+          call dump_r4_line(u, u10dir_bwv(1, 1))
+       end if
+
+       ! ---- boundary enclosure polyline
+       write (u, '(A)') 'section enc'
+       write (u, '(A,1X,I0)') 'n', n_bndenc
+       if (n_bndenc > 0) then
+          write (u, '(A,1X,I0)') 'x', n_bndenc
+          do i = 1, n_bndenc
+             call dump_r8_line(u, x_bndenc(i))
+          end do
+          write (u, '(A,1X,I0)') 'y', n_bndenc
+          do i = 1, n_bndenc
+             call dump_r8_line(u, y_bndenc(i))
+          end do
+       end if
+
+       ! ---- neumann polyline
+       write (u, '(A)') 'section neu'
+       write (u, '(A,1X,I0)') 'n', n_neu
+       if (n_neu > 0) then
+          write (u, '(A,1X,I0)') 'x', n_neu
+          do i = 1, n_neu
+             call dump_r8_line(u, x_neu(i))
+          end do
+          write (u, '(A,1X,I0)') 'y', n_neu
+          do i = 1, n_neu
+             call dump_r8_line(u, y_neu(i))
+          end do
+       end if
+
+       write (u, '(A)') 'section end'
+       !
+    end subroutine dump_text_globals
+
+    subroutine dump_r8_line(u, v)
+       !
+       integer, intent(in) :: u
+       real*8, intent(in) :: v
+       integer(c_int64_t) :: bits
+       bits = transfer(v, bits)
+       write (u, '(Z16.16)') bits
+    end subroutine dump_r8_line
+
+    subroutine dump_r4_line(u, v)
+       !
+       integer, intent(in) :: u
+       real*4, intent(in) :: v
+       integer(c_int32_t) :: bits
+       bits = transfer(v, bits)
+       write (u, '(Z8.8)') bits
+    end subroutine dump_r4_line
 end module snapwave_c_api

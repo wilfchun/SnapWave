@@ -28,6 +28,14 @@
 //! stays (isolated in `RunContext::enter_run_dir`) until the Phase 6-7
 //! readers accept explicit paths.
 //!
+//! Phase 6 (plan.md): the auxiliary *text* input readers are migrated to
+//! Rust (`text_input`): observation points, single-point JONSWAP and
+//! space/time-varying boundary files, wind, and the enclosure/neumann
+//! polylines are parsed into Rust-owned structs and validated before the
+//! model runs. The `--compare-text` mode pins the Rust parsers against the
+//! unchanged Fortran readers through the temporary `snapwave_text_dump_c`
+//! hook (`text_compare`).
+//!
 //! Status codes: 0 on success (including `--help`/`--version`), 2 on
 //! wrapper-detected errors, and any non-zero Fortran status is passed
 //! through unchanged.
@@ -38,6 +46,8 @@ mod input;
 mod input_compare;
 mod paths;
 mod run_context;
+mod text_compare;
+mod text_input;
 
 use anyhow::Context;
 use std::ffi::{c_char, c_int, OsString};
@@ -73,6 +83,16 @@ extern "C" {
         dump_path: *const c_char,
         dump_path_len: c_int,
     ) -> c_int;
+
+    // Phase 6 comparison hook: read the auxiliary text inputs with the
+    // unchanged Fortran readers and dump the resulting globals, pinning the
+    // Rust parsers in `text_input` against the numerical oracle.
+    fn snapwave_text_dump_c(
+        config: *const c_char,
+        config_len: c_int,
+        dump_path: *const c_char,
+        dump_path_len: c_int,
+    ) -> c_int;
 }
 
 fn main() {
@@ -93,6 +113,13 @@ fn main() {
             0
         }
         Ok(Invocation::CompareInput(cmd)) => match compare_input_with_fortran(cmd, exe) {
+            Ok(status) => status,
+            Err(err) => {
+                eprintln!("error: {err:#}");
+                EXIT_USAGE
+            }
+        },
+        Ok(Invocation::CompareText(cmd)) => match compare_text_with_fortran(cmd, exe) {
             Ok(status) => status,
             Err(err) => {
                 eprintln!("error: {err:#}");
@@ -133,6 +160,16 @@ fn execute(cmd: cli::RunCommand, exe: ExeMeta) -> Result<i32> {
     // missing output directories are created (and unusable ones
     // rejected) in Rust, before the Fortran core runs.
     let run_paths = paths::RunPaths::resolve(&ctx.run_dir, &config);
+
+    // plan.md Phase 6: parse and validate every auxiliary text input in
+    // Rust, so the data is Rust-owned before the timestep loop starts.
+    // The Fortran readers remain the runtime authority (they also compute
+    // interpolation weights that move in Phase 9); the Rust parse is
+    // validated against them by `--compare-text`.
+    let text_inputs = text_input::parse_all(&run_paths, &config)?;
+    if ctx.log.verbose {
+        diagnostics::report_text_input_diagnostics(&text_inputs);
+    }
 
     // After parsing: the run context can now include the resolved
     // output paths (Phase 5).
@@ -248,6 +285,66 @@ fn compare_input_with_fortran(cmd: cli::RunCommand, exe: ExeMeta) -> Result<i32>
 
     if ctx.log.verbose {
         eprintln!("resolved handoff: config round-trips through Fortran ({count2} values compared)");
+    }
+    Ok(0)
+}
+
+/// `--compare-text`: parse the auxiliary text inputs in Rust, run the
+/// unchanged Fortran readers through the temporary Phase 6 hook, and
+/// compare the resulting globals. Exits 0 on agreement, without running
+/// the model (plan.md Phase 6, step 2).
+fn compare_text_with_fortran(cmd: cli::RunCommand, exe: ExeMeta) -> Result<i32> {
+    let ctx = RunContext::new(cmd.input, exe, LogPrefs { verbose: cmd.verbose })?;
+    let config = input::parse_file(&ctx.input_path)?;
+    let run_paths = paths::RunPaths::resolve(&ctx.run_dir, &config);
+
+    // Rust-parse the auxiliary text inputs (family 1-5 of plan.md Phase 6).
+    let rust = text_input::parse_all(&run_paths, &config)?;
+    if ctx.log.verbose {
+        diagnostics::report_text_input_diagnostics(&rust);
+    }
+
+    // The Fortran hook reads the mesh and the sibling text files relative
+    // to the run directory (same chdir contract as a real run).
+    ctx.enter_run_dir()?;
+
+    let text = config.to_config_text();
+    let c_text = std::ffi::CString::new(text)
+        .with_context(|| "config text contains an embedded NUL byte")?;
+
+    let dump_path =
+        std::env::temp_dir().join(format!("snapwave-text-dump-{}.txt", std::process::id()));
+    let c_dump = path_to_cstring(&dump_path)?;
+    // Only the dump *path* is limited to 1024 bytes (the facade uses
+    // character(len=1024) for file paths); the config text is dynamically
+    // allocated in Fortran.
+    if c_dump.as_bytes().len() > 1024 {
+        bail!("dump path is too long for the FFI facade (>1024 bytes)");
+    }
+
+    let status = unsafe {
+        snapwave_text_dump_c(
+            c_text.as_ptr(),
+            c_text.as_bytes().len() as c_int,
+            c_dump.as_ptr(),
+            c_dump.as_bytes().len() as c_int,
+        )
+    };
+    if status != 0 {
+        let _ = std::fs::remove_file(&dump_path);
+        bail!("the Fortran text readers failed with status {status}");
+    }
+
+    let dump_text = std::fs::read_to_string(&dump_path)
+        .with_context(|| format!("reading the Fortran text dump at {}", dump_path.display()))?;
+    let _ = std::fs::remove_file(&dump_path);
+
+    let count = text_compare::check(&rust, &dump_text).with_context(|| {
+        format!("comparing the Rust and Fortran text-input parses of {}", ctx.input_path.display())
+    })?;
+
+    if ctx.log.verbose {
+        eprintln!("text inputs: Rust parse matches the Fortran globals ({count} values compared)");
     }
     Ok(0)
 }

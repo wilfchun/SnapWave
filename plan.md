@@ -321,6 +321,41 @@ Acceptance:
   covered.
 - No parser migration changes numerical output beyond defined tolerances.
 
+Status: implemented (2026-08-20). The parsers live in `src_rust/text_input.rs`
+with the Fortran list-directed semantics preserved verbatim (blank-line
+skipping, blank/comma/slash separators, quoted literals skipped by numeric
+reads — so a dangling `'` after the last number, as in one checked-in obs
+file, still parses — `D` exponents, `character*32` name truncation, the
+`station_%04d` default name, the per-file `t_bwv` overwrite of the boundary
+time-series reader, and the `wd`/`ds` degree→radian conversions using the
+same `deg2rad = 4*atan(1)/180d0` recipe as `snapwave_data.f90`). Rust-owned
+structs (step 3) group the data by reader: `ObsPoints`, `JonswapSeries`,
+`BoundarySeries`, `WindInput` (`Uniform`/`List`), `Polyline` (shared by the
+enclosure and Neumann readers), plus `AsciiMesh` and `SamplePoints` for the
+plain-text mesh/sample readers. The comparison hook (step 2) is
+`snapwave_text_dump_c` in `src/snapwave_c_api.f90`: it loads the resolved
+config, runs `initialize_snapwave_domain`, `read_obs_points`,
+`read_boundary_data` and `read_wind_data`, then dumps the resulting globals
+(reals as IEEE-754 bit patterns) for comparison by
+`src_rust/text_compare.rs` (reals compared within the 1e-6/1e-9 relative
+tolerances already used by the Phase 3/4 comparison; integers/names exact).
+The wrapper's `--compare-text` mode (`src_rust/main.rs`) drives that
+comparison; `tests/text_input.rs` runs it on the checked-in cases (31 coarse:
+obs+boundary time series+enclosure+Neumann; 32/33: single-point JONSWAP +
+enclosure; 45 haringvliet: quoted obs names) and asserts agreement. The run
+path (`execute` in `src_rust/main.rs`) now parses and validates every
+auxiliary text input in Rust before the model runs (acceptance: data is
+Rust-owned before the timestep loop), reporting a verbose summary through
+`diagnostics::report_text_input_diagnostics`. The Fortran readers remain the
+runtime authority (acceptance: reader code remains available) — the
+coarse-boundary handoff of the parsed data and the bypass of the Fortran
+readers are deferred to Phase 8 (data structures) / Phase 9 (interpolation),
+because the readers also compute `make_map_fm`/`find_boundary_indices`
+interpolation weights that are out of scope for text parsing. Family 6 has no
+checked-in testcase (every mesh is NetCDF; `fw60.xyz` sample interpolation is
+Phase 9), so `AsciiMesh`/`SamplePoints` are unit-tested only and not part of
+the oracle comparison yet.
+
 ## Phase 7: NetCDF Input And Output
 
 Goal: move NetCDF schema handling and file IO to Rust while leaving solver state

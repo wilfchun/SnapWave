@@ -40,6 +40,10 @@ pub enum Invocation {
     /// through the temporary Phase 3 hook, and exit without running the
     /// model (plan.md Phase 3, step 5; removed again in Phase 4+).
     CompareInput(RunCommand),
+    /// Parse the auxiliary text inputs in Rust, compare against the
+    /// Fortran readers through the temporary Phase 6 hook, and exit
+    /// without running the model (plan.md Phase 6, step 2).
+    CompareText(RunCommand),
 }
 
 /// A requested model run, still unvalidated: input validation happens when
@@ -63,6 +67,7 @@ pub fn parse(args: &[OsString]) -> Result<Invocation, String> {
     let mut input: Option<OsString> = None;
     let mut verbose = false;
     let mut compare_input = false;
+    let mut compare_text = false;
     let mut only_positional = false;
 
     for arg in args.iter().skip(1) {
@@ -81,6 +86,7 @@ pub fn parse(args: &[OsString]) -> Result<Invocation, String> {
             }
             (true, Some("-v")) | (true, Some("--verbose")) => verbose = true,
             (true, Some("--compare-input")) => compare_input = true,
+            (true, Some("--compare-text")) => compare_text = true,
             (true, Some(other)) => return Err(format!("unknown option: {other}")),
             (true, None) => {
                 return Err(format!("unknown option: {}", arg.to_string_lossy()));
@@ -96,6 +102,7 @@ pub fn parse(args: &[OsString]) -> Result<Invocation, String> {
     let command = |input: OsString| RunCommand { input: PathBuf::from(input), verbose };
     match input {
         Some(input) if compare_input => Ok(Invocation::CompareInput(command(input))),
+        Some(input) if compare_text => Ok(Invocation::CompareText(command(input))),
         Some(input) => Ok(Invocation::Run(command(input))),
         None => Err(format!("missing input path (expected one {INPUT_FILE_HINT} file)")),
     }
@@ -136,6 +143,10 @@ Options:
   --compare-input  Parse INPUT in Rust and compare the result against the
                    legacy Fortran reader AND the resolved-config handoff,
                    then exit without running the model (plan.md Phase 3/4)
+  --compare-text   Parse INPUT and its auxiliary text files (obs points,
+                   boundary, wind, enclosure/neumann) in Rust and compare
+                   against the Fortran readers, then exit without running
+                   the model (plan.md Phase 6)
   -h, --help     Print this help and exit
   -V, --version  Print version information and exit
 
@@ -236,6 +247,21 @@ mod tests {
         assert!(err.contains("missing input"), "error was: {err}");
         // Documented in the help text.
         assert!(help_text("snapwave").contains("--compare-input"));
+    }
+
+    #[test]
+    fn compare_text_flag_is_parsed() {
+        match parse(&args(&["--compare-text", "SnapWave.inp"])) {
+            Ok(Invocation::CompareText(cmd)) => {
+                assert_eq!(cmd.input, PathBuf::from("SnapWave.inp"));
+                assert!(!cmd.verbose);
+            }
+            other => panic!("expected a compare-text invocation, got {other:?}"),
+        }
+        // Still needs the positional input path.
+        let err = parse(&args(&["--compare-text"])).expect_err("input path still required");
+        assert!(err.contains("missing input"), "error was: {err}");
+        assert!(help_text("snapwave").contains("--compare-text"));
     }
 
     #[test]

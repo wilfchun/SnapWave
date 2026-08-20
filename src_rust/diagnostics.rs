@@ -7,6 +7,7 @@
 //! configuration-related console chatter.
 
 use crate::input::SnapWaveInput;
+use crate::text_input::{BoundaryInput, ParsedTextInputs, WindInput};
 
 /// Emit the informational messages that the legacy Fortran reader used to
 /// print, now structured and Rust-owned. Called after parsing and before
@@ -22,4 +23,36 @@ pub fn report_input_diagnostics(cfg: &SnapWaveInput, verbose: bool) {
     } else {
         eprintln!("   Uniform wave period in entire domain.");
     }
+}
+
+/// One-line verbose summary of the Rust-parsed auxiliary text inputs
+/// (plan.md Phase 6). Emitted only in verbose mode.
+pub fn report_text_input_diagnostics(text: &ParsedTextInputs) {
+    let obs = match &text.obs {
+        Some(o) => format!("{} points", o.len()),
+        None => "none".to_string(),
+    };
+    let boundary = match &text.boundary {
+        BoundaryInput::None => "none".to_string(),
+        BoundaryInput::Single(j) => format!("single-point JONSWAP ({} records)", j.len()),
+        BoundaryInput::Timeseries(s) => {
+            format!("{} support points x {} time steps", s.nwbnd, s.ntwbnd)
+        }
+    };
+    let wind = match &text.wind {
+        WindInput::Uniform(u) => match (u.u10, u.u10dir_deg) {
+            (Some(mag), Some(dir)) => format!("uniform ({mag} m/s @ {dir} deg)"),
+            _ => "uniform (file-backed)".to_string(),
+        },
+        WindInput::List(l) => format!("list ({} records)", l.len()),
+    };
+    let enc = match &text.enclosure {
+        Some(p) => format!("{} points", p.len()),
+        None => "none".to_string(),
+    };
+    let neu = match &text.neumann {
+        Some(p) => format!("{} points", p.len()),
+        None => "none".to_string(),
+    };
+    eprintln!("text inputs: obs {obs}; boundary {boundary}; wind {wind}; enclosure {enc}; neumann {neu}");
 }

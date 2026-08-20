@@ -21,9 +21,10 @@ Current state: the Cargo-orchestrated wrapper/bootstrap is complete, and
 plan.md Phases 1 (test oracle and baselines), 2 (Rust CLI and run
 context), 3 (`SnapWave.inp` parsing in Rust, validated against the
 Fortran reader through the temporary `--compare-input` hook), 4 (config
-defaults, validation, and diagnostics) and 5 (filesystem and output
-directory handling in Rust) are done. Phase 6 (text input readers) is
-the active frontier.
+defaults, validation, and diagnostics), 5 (filesystem and output
+directory handling in Rust) and 6 (auxiliary text input readers, validated
+against the Fortran readers through the temporary `--compare-text` hook)
+are done. Phase 7 (NetCDF input and output) is the active frontier.
 
 ## Non-negotiable rules
 

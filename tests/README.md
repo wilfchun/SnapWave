@@ -15,6 +15,7 @@ build internals.
 | `input_parse.rs` | Phase-3 input parsing: Rust-vs-Fortran parse comparison for every checked-in `SnapWave.inp`, grammar-quirk agreement, invalid-input wrapper errors |
 | `input_validate.rs` | Phase-4 validation: bad intervals, optional output settings, missing input file, resolved-config handoff |
 | `output_dirs.rs` | Phase-5 filesystem tests: nested run directories, wrapper-created output parents, disabled map/history output |
+| `text_input.rs` | Phase-6 text-reader tests: `--compare-text` parity against the Fortran readers on checked-in cases |
 | `ncdf_parser.rs` | Self-tests of the NetCDF reader against committed fixtures (no model run) |
 | `support/ncdf.rs` | Dependency-free reader for NetCDF classic (CDF-1/CDF-2) files |
 | `support/harness.rs` | Testcase copying, separator normalization, wrapper/oracle execution |
@@ -67,6 +68,26 @@ handoff end-to-end.
 
 The full `SnapWave.inp` grammar — keyword matching, quirks, defaults — is
 documented in the module docs of `src_rust/input.rs`.
+
+## Text input readers (Phase 6)
+
+`text_input.rs` exercises the Phase-6 comparison hook through the wrapper's
+`--compare-text` mode: the Rust parsers in `src_rust/text_input.rs`
+(observation points, single-point JONSWAP, boundary time series, wind,
+enclosure/Neumann polylines) parse the same files as the Fortran readers, and
+every resulting global must agree (reals via IEEE-754 bit patterns within the
+1e-6/1e-9 relative tolerances, integers and names exact). Unlike
+`--compare-input` this needs the mesh, so the checked-in cases are copied to a
+temp dir (separators normalized in the copy) and the hook runs the unchanged
+Fortran readers — `initialize_snapwave_domain` + `read_obs_points` +
+`read_boundary_data` + `read_wind_data` — before dumping. The curated cases
+cover obs points with/without names, single-point JONSWAP, single-point
+boundary time series, enclosure and Neumann polylines. The grammar and the
+list-directed quirks (blank-line skipping, quoted-literal handling, the
+`t_bwv` overwrite, degree→radian conversions) are documented in
+`src_rust/text_input.rs`, which also unit-tests the multi-point time series,
+the wind list, and the plain-text mesh/sample readers (family 6, no checked-in
+coverage yet).
 
 ## Output-directory handling (Phase 5)
 
