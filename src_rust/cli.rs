@@ -134,8 +134,8 @@ Arguments:
 Options:
   -v, --verbose  Print the run context before starting the model
   --compare-input  Parse INPUT in Rust and compare the result against the
-                   legacy Fortran reader, then exit without running the
-                   model (temporary equivalence check, plan.md Phase 3)
+                   legacy Fortran reader AND the resolved-config handoff,
+                   then exit without running the model (plan.md Phase 3/4)
   -h, --help     Print this help and exit
   -V, --version  Print version information and exit
 

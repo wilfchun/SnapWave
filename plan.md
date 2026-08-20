@@ -188,8 +188,8 @@ cases. Step 6 is done via the optional `input_file` argument of
 name-probing behaviour), and the wrapper now parses and validates the
 input in Rust before calling the facade, so invalid input is a wrapper
 error (exit 2) with the Fortran core never invoked. Defaults, broader
-validation and the remaining input-reader `stop` paths stay Fortran-owned
-until Phase 4.
+validation and the remaining input-reader `stop` paths moved to Rust in
+Phase 4.
 
 ## Phase 4: Config Defaults, Validation, And Diagnostics
 
@@ -214,6 +214,29 @@ Acceptance:
 - Invalid configuration fails before domain initialization.
 - Legacy and Rust paths agree on accepted testcase configuration.
 
+Status: implemented (2026-08-19). Defaults live in `src_rust/input.rs::defaults`
+as named constants (step 1). The Rust parser resolves the entire configuration
+(defaults, validation, post-processing) and passes it to the Fortran facade as
+canonical `key=value` text through `snapwave_run_c`; Fortran stores it via the
+new `read_resolved_input` subroutine in `src/snapwave_input.f90` and no longer
+reads `SnapWave.inp` or decides defaults on the Rust route (acceptance:
+"Fortran no longer decides main config defaults"). Validation (step 2) covers
+the non-positive output-interval checks (already in Rust since Phase 3) plus
+the input-file existence check in `RunContext`; all invalid-configuration
+errors are wrapper exit 2 before the Fortran core runs (acceptance: "Invalid
+configuration fails before domain initialization"). Structured diagnostics
+live in `src_rust/diagnostics.rs` (step 3): the wind-switch informational
+message is preserved, and verbose mode reports the parse/validation status.
+Validation tests in `tests/input_validate.rs` cover bad intervals, optional
+output settings, missing input file, and the resolved-config handoff (step 4).
+The five `stop 1` paths in `read_snapwave_input` are converted to status
+returns via an optional `status` argument (step 5); the legacy stand-alone
+program omits the argument and keeps the original `stop` behaviour. The
+`--compare-input` mode now verifies BOTH the legacy-reader equivalence
+(Phase 3) and the resolved-config handoff (Phase 4) through the new
+`snapwave_load_config_dump_c` hook, so "Legacy and Rust paths agree on
+accepted testcase configuration" is pinned by every `cargo test` run.
+
 ## Phase 5: Filesystem And Output Directory Handling
 
 Goal: make all path resolution and output directory behaviour explicit in Rust.
@@ -235,6 +258,37 @@ Acceptance:
 - The wrapper no longer needs global `chdir` after downstream readers accept
   explicit paths.
 - Existing testcases continue to run unchanged from the user's perspective.
+
+Status: implemented (2026-08-20). Path resolution is centralized in
+`src_rust/paths.rs` (step 1): every file reference of `SnapWave.inp`
+resolves against the input file's directory through one module
+(`RunPaths::resolve`), ready for the Phase 6 readers to consume as
+Rust-owned paths. Output paths are `PathBuf`s (step 2) and the required
+output directories are created — or, when the path already is a
+directory or the parent cannot be created, rejected with a clean
+wrapper error — in Rust before the Fortran core runs (step 3). This is
+a deliberate wrapper improvement over the legacy binary, which fails
+inside the NetCDF writer when the directory is missing; it changes no
+scientific behaviour. Legacy semantics are preserved verbatim (step 4):
+empty strings mean "not configured", `bndfile`/`encfile`/`neumannfile`/
+`obsfile` disable on any value whose first four characters are `none`
+(mirroring the `name(1:4) /= 'none'` guards), map/history output
+disables only on the empty string (`none` would be a literal file
+name), relative paths (including `..`) join verbatim, and Windows `\`
+separators are deliberately not normalized (that stays a temp-copy
+concern of the test harness). Tests (step 5) live in
+`tests/output_dirs.rs` (nested run directories, missing output parents
+both created and uncreatable, disabled map output, disabled history
+output, Windows-style separators in temp copies) plus unit tests in
+`src_rust/paths.rs`; `tests/mwe.rs` and the flake smoke test no longer
+pre-create `output/`, pinning wrapper ownership (the Phase-1 harness
+still pre-creates it for the legacy oracle run, which cannot create
+directories itself). Acceptance: Rust owns run/output directory policy;
+the `chdir` removal is deliberately deferred — the downstream readers
+accept explicit paths only from Phase 6 on, so the contract stays
+isolated in `RunContext::enter_run_dir()`; all existing testcases run
+unchanged (regression suite green, including the live-oracle
+comparison).
 
 ## Phase 6: Text Input Readers
 

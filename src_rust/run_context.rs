@@ -2,14 +2,18 @@
 //!
 //! `RunContext` captures everything the wrapper knows about *where* and
 //! *how* a model runs before the Fortran core takes over: the input paths,
-//! the run directory, executable metadata and logging preferences. Later
-//! phases extend or replace parts of it as input parsing (Phase 3) and
-//! output-directory policy (Phase 5) migrate to Rust.
+//! the run directory, executable metadata and logging preferences. Path
+//! resolution against the run directory and the output-directory policy
+//! live in `crate::paths` since plan.md Phase 5; this struct remains the
+//! process-level anchor (input path, run directory, legacy `chdir`
+//! contract).
 
 use std::ffi::{CString, OsStr, OsString};
 use std::path::{Path, PathBuf};
 
 use anyhow::{bail, Context, Result};
+
+use crate::paths::OutputPaths;
 
 /// Executable metadata used for `--version` output and diagnostics.
 pub struct ExeMeta {
@@ -40,13 +44,10 @@ pub struct RunContext {
     /// Canonicalized absolute path of the validated input file.
     pub input_path: PathBuf,
     /// Directory of the input file; the model runs here (legacy Fortran
-    /// relative-path contract, see [`RunContext::enter_run_dir`]).
+    /// relative-path contract, see [`RunContext::enter_run_dir`]). Every
+    /// file reference of `SnapWave.inp` resolves against it
+    /// (`crate::paths`, plan.md Phase 5).
     pub run_dir: PathBuf,
-    /// Expected output directory, if known. `None` for now: output file
-    /// names and locations come from `SnapWave.inp` and are resolved by the
-    /// Fortran core relative to the run directory. Rust takes ownership of
-    /// output-directory policy in plan.md Phase 5.
-    pub output_dir: Option<PathBuf>,
     /// Executable metadata (name, version).
     pub exe: ExeMeta,
     /// Logging preferences for the wrapper.
@@ -72,21 +73,24 @@ impl RunContext {
             .map(Path::to_path_buf)
             .with_context(|| format!("input path has no parent directory: {}", input_path.display()))?;
 
-        Ok(RunContext { input_arg, input_path, run_dir, output_dir: None, exe, log })
+        Ok(RunContext { input_arg, input_path, run_dir, exe, log })
     }
 
-    /// Human-readable summary printed for `--verbose`.
-    pub fn describe(&self) -> String {
-        let output_dir = match &self.output_dir {
-            Some(dir) => dir.display().to_string(),
-            None => "defined by SnapWave.inp (Fortran-owned until plan.md Phase 5)".to_string(),
+    /// Human-readable summary printed for `--verbose`. Called after the
+    /// input has been parsed so it can include the resolved output paths
+    /// (plan.md Phase 5).
+    pub fn describe(&self, outputs: &OutputPaths) -> String {
+        let out = |p: &Option<PathBuf>| match p {
+            Some(p) => p.display().to_string(),
+            None => "(disabled)".to_string(),
         };
         [
             format!("snapwave {} run context", self.exe.version),
             format!("  input (as given) : {}", self.input_arg.display()),
             format!("  input (resolved) : {}", self.input_path.display()),
             format!("  run directory    : {}", self.run_dir.display()),
-            format!("  output directory : {output_dir}"),
+            format!("  map output       : {}", out(&outputs.map)),
+            format!("  his output       : {}", out(&outputs.his)),
             "  model core       : Fortran via the C ABI facade".to_string(),
         ]
         .join("\n")
@@ -96,11 +100,12 @@ impl RunContext {
     ///
     /// The Fortran readers resolve all sibling input and output paths
     /// relative to the current working directory, so until those readers
-    /// and the output handling migrate to Rust (Phases 5 and 6) the
-    /// wrapper must `chdir` into the input file's directory before calling
-    /// the facade. (The input file itself has been Rust-selected and
-    /// passed down explicitly since Phase 3; everything else is still
-    /// CWD-relative on the Fortran side.) The contract is isolated in this
+    /// and the NetCDF IO migrate to Rust (Phases 6 and 7) the wrapper
+    /// must `chdir` into the input file's directory before calling the
+    /// facade. (The input file itself has been Rust-selected and passed
+    /// down explicitly since Phase 3, and the output *directories* are
+    /// Rust-owned since Phase 5 — but the file *names* still cross to
+    /// Fortran as CWD-relative text.) The contract is isolated in this
     /// single method so later phases can remove it cleanly.
     pub fn enter_run_dir(&self) -> Result<()> {
         std::env::set_current_dir(&self.run_dir)

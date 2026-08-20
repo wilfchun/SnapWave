@@ -3,10 +3,11 @@
 //! Mirrors the reference flow used by the Nix flake `smoke-test` check:
 //!   1. copy the coarse shoaling/refraction testcase to a temp directory;
 //!   2. normalize Windows path separators in the copied `SnapWave.inp`;
-//!   3. create the output directory the testcase writes to;
-//!   4. run the Cargo-built Rust wrapper;
-//!   5. verify the map/history NetCDF files exist;
-//!   6. validate the NetCDF headers with `ncdump -h` (when available).
+//!   3. run the Cargo-built Rust wrapper — which creates the missing
+//!      output directory itself (plan.md Phase 5: Rust owns
+//!      output-directory policy);
+//!   4. verify the map/history NetCDF files exist;
+//!   5. validate the NetCDF headers with `ncdump -h` (when available).
 //!
 //! Numeric comparisons against committed references are intentionally left
 //! for a later phase; this test pins down structure and exit semantics.
@@ -46,9 +47,12 @@ fn coarse_shoaling_refraction_runs_through_rust_wrapper() {
     let content = fs::read_to_string(&inp_path).expect("read SnapWave.inp");
     fs::write(&inp_path, content.replace('\\', "/")).expect("write normalized SnapWave.inp");
 
-    // 3. The testcase writes to ../../output relative to the run directory.
+    // 3. The testcase writes to ../../output relative to the run
+    //    directory. The directory is deliberately NOT created here: the
+    //    wrapper owns output-directory policy and must create it
+    //    (plan.md Phase 5, pinned by this smoke test).
     let output_dir = work.join("output");
-    fs::create_dir_all(&output_dir).expect("create output dir");
+    assert!(!output_dir.exists(), "precondition: output dir must be created by the wrapper");
 
     // 4. Run the Cargo-built wrapper binary.
     let bin = env!("CARGO_BIN_EXE_snapwave");
@@ -67,7 +71,8 @@ fn coarse_shoaling_refraction_runs_through_rust_wrapper() {
         stderr
     );
 
-    // 5. Verify generated files exist and are non-empty.
+    // 5. Verify generated files exist and are non-empty (the wrapper
+    //    must have created the output directory).
     let his = output_dir.join("shoalref_coarse_neu_his.nc");
     let map = output_dir.join("shoalref_coarse_neu_map.nc");
     for file in [&his, &map] {

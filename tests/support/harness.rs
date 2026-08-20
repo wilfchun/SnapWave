@@ -110,6 +110,12 @@ impl CaseSpec {
         }
         let inp = find_input_file(&run_dir)?;
         let output_dir = root.join("output");
+        // Pre-created on purpose for the *oracle*: the legacy Fortran
+        // binary cannot create output directories (it fails inside the
+        // NetCDF writer). The Rust wrapper creates them itself since
+        // plan.md Phase 5 — its ownership is pinned by `tests/mwe.rs`
+        // and `tests/output_dirs.rs`, which deliberately do not
+        // pre-create; for wrapper runs this is an idempotent no-op.
         fs::create_dir_all(&output_dir)
             .with_context(|| format!("creating output dir {}", output_dir.display()))?;
 

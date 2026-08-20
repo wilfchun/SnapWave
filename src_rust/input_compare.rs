@@ -1,12 +1,15 @@
-//! Rust side of the temporary Phase 3 Fortran comparison hook
-//! (plan.md Phase 3, step 5).
+//! Rust side of the Fortran comparison hooks (plan.md Phase 3 step 5 and
+//! Phase 4).
 //!
 //! [`check`] compares a [`SnapWaveInput`] parse result against the
-//! canonical `key=value` dump produced by `snapwave_read_input_dump_c`
-//! (`src/snapwave_c_api.f90`), which runs the legacy Fortran reader and
-//! dumps every `snapwave_data` global it sets. Both value tables must
-//! stay in sync; the comparison reports missing/extra keys so a mismatch
-//! is caught by `tests/input_parse.rs`.
+//! canonical `key=value` dump produced by either:
+//!   - `snapwave_read_input_dump_c`  (legacy Fortran reader, Phase 3), or
+//!   - `snapwave_load_config_dump_c` (resolved-config handoff, Phase 4).
+//!
+//! Both hooks produce the same format (see `dump_globals` in
+//! `src/snapwave_c_api.f90`), so the comparison is identical. The
+//! resolved-handoff comparison pins that the Phase 4 config transfer
+//! (Rust -> text -> Fortran globals) round-trips exactly.
 //!
 //! Dump conventions (mirrored from the Fortran side):
 //! integers decimal, real*4/real*8 as zero-padded IEEE-754 bit patterns in
@@ -15,10 +18,6 @@
 //! `sigmin`/`sigmax` defaults involve `atan(1.0)`, whose libm results may
 //! differ in the last ulp between the Fortran and Rust runtimes while
 //! being numerically identical for configuration purposes.
-//!
-//! This module — and the facade hook it mirrors — is temporary scaffolding
-//! and gets removed once plan.md Phase 4 retires the Fortran input reader
-//! from the Rust path.
 
 use std::collections::BTreeMap;
 

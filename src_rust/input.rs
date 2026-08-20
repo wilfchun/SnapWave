@@ -324,6 +324,73 @@ impl Keywords {
     }
 }
 
+/// Default values of `read_snapwave_input` (src/snapwave_input.f90),
+/// moved here so Rust is the single authority for configuration defaults
+/// on the Rust path (plan.md Phase 4, step 1). Named exactly like the
+/// Fortran globals/keywords they back.
+pub(crate) mod defaults {
+    // Time / control
+    pub const TREF: &str = "20000101 000000";
+    pub const TIMESTEP: f32 = 3600.0;
+    pub const NITER: i32 = 10;
+    pub const CRIT: f32 = 0.00001;
+    pub const DT: f32 = 36000.0;
+    pub const RESTART: i32 = 0;
+    // Grid / domain
+    pub const NMAX: i32 = 0;
+    pub const MMAX: i32 = 0;
+    pub const DX: f32 = 0.0;
+    pub const DY: f32 = 0.0;
+    pub const X0: f32 = 0.0;
+    pub const Y0: f32 = 0.0;
+    pub const ROTATION: f32 = 0.0;
+    pub const POSDWN: f32 = -1.0;
+    pub const GRIDFILE: &str = ".txt";
+    pub const SFERIC: i32 = 0;
+    pub const DTHETA: f32 = 10.0;
+    pub const SECTOR: f32 = 180.0;
+    // Boundary forcing
+    pub const BNDFILE: &str = "none";
+    pub const ENCFILE: &str = "none";
+    pub const NEUMANNFILE: &str = "none";
+    pub const OBSFILE: &str = "none";
+    pub const TOL: f32 = 10.0;
+    // Wind
+    pub const U10: &str = "0.0";
+    pub const U10DIR: &str = "270.0";
+    pub const MWIND: i32 = 2;
+    // Output selection
+    pub const MAP_DEPTH: i32 = 1;
+    pub const MAP_HM0: i32 = 1;
+    pub const MAP_TP: i32 = 1;
+    pub const MAP_DIR: i32 = 1;
+    pub const WRITETESTFILES: i32 = 0;
+    // Diagnostics / vegetation
+    pub const JA_VEGETATION: i32 = 0;
+    pub const VEGMAPFILE: &str = ".txt";
+    // Solver physics knobs
+    pub const GAMMA: f32 = 0.7;
+    pub const ALPHA: f32 = 1.0;
+    pub const HMIN: f32 = 0.1;
+    pub const GAMMAX: f32 = 0.6;
+    pub const FW: &str = "0.01";
+    pub const FW_IG: &str = "0.015";
+    pub const FWCUTOFF: f32 = 200.0;
+    pub const TPINI: f32 = 1.0;
+    pub const ZSINI: f32 = 0.0;
+    pub const JADCGDX: i32 = 1;
+    pub const C_DISPT: f32 = 1.0;
+    pub const IG: i32 = 0;
+    pub const UPWINDREF: i32 = 0;
+}
+
+/// `8.0 * atan(1.0)` in single-precision arithmetic, the Fortran default
+/// expression behind `sigmin`/`sigmax` (not a compile-time constant, so it
+/// is evaluated at runtime exactly as `read_snapwave_input` does).
+fn two_pi_f32() -> f32 {
+    8.0f32 * 1.0f32.atan()
+}
+
 /// Parse `text` (the full content of a `SnapWave.inp`) into a
 /// [`SnapWaveInput`]. Errors carry the offending line and keyword.
 pub fn parse_str(text: &str) -> Result<SnapWaveInput> {
@@ -331,39 +398,40 @@ pub fn parse_str(text: &str) -> Result<SnapWaveInput> {
 
     // Reads follow the exact call order of read_snapwave_input(); the
     // order matters only where a default references an earlier keyword
-    // (map_interval/his_interval default to the parsed timestep).
-    let nmax = int_of(&kw, "nmax", 0)?;
-    let mmax = int_of(&kw, "mmax", 0)?;
-    let dx = real_of(&kw, "dx", 0.0)?;
-    let dy = real_of(&kw, "dy", 0.0)?;
-    let x0 = real_of(&kw, "x0", 0.0)?;
-    let y0 = real_of(&kw, "y0", 0.0)?;
-    let rotation = real_of(&kw, "rotation", 0.0)?;
-    let posdwn = real_of(&kw, "posdwn", -1.0)?;
-    let trefstr = char_of(&kw, "tref", "20000101 000000", WIDTH_DATE)?;
-    let tstartstr = char_of(&kw, "tstart", "20000101 000000", WIDTH_DATE)?;
-    let tstopstr = char_of(&kw, "tstop", "20000101 000000", WIDTH_DATE)?;
-    let timestep = real_of(&kw, "timestep", 3600.0)?;
-    let niter = int_of(&kw, "niter", 10)?;
-    let crit = real_of(&kw, "crit", 0.00001)?;
-    let dt = real_of(&kw, "dt", 36000.0)?;
-    let gamma = real_of(&kw, "gamma", 0.7)?;
-    let alpha = real_of(&kw, "alpha", 1.0)?;
-    let hmin = real_of(&kw, "hmin", 0.1)?;
-    let gammax = real_of(&kw, "gammax", 0.6)?;
-    let gridfile = char_of(&kw, "gridfile", ".txt", WIDTH_FILENAME)?;
-    let sferic = int_of(&kw, "sferic", 0)?;
-    let fwstr = char_of(&kw, "fw", "0.01", WIDTH_VALUE_STR)?;
-    let fw_igstr = char_of(&kw, "fwig", "0.015", WIDTH_VALUE_STR)?;
-    let fwcutoff = real_of(&kw, "fwcutoff", 200.0)?;
-    let tol = real_of(&kw, "tol", 10.0)?;
-    let dtheta = real_of(&kw, "dtheta", 10.0)?;
-    let sector = real_of(&kw, "sector", 180.0)?;
+    // (map_interval/his_interval default to the parsed timestep). All
+    // defaults come from `defaults` (plan.md Phase 4, step 1).
+    let nmax = int_of(&kw, "nmax", defaults::NMAX)?;
+    let mmax = int_of(&kw, "mmax", defaults::MMAX)?;
+    let dx = real_of(&kw, "dx", defaults::DX)?;
+    let dy = real_of(&kw, "dy", defaults::DY)?;
+    let x0 = real_of(&kw, "x0", defaults::X0)?;
+    let y0 = real_of(&kw, "y0", defaults::Y0)?;
+    let rotation = real_of(&kw, "rotation", defaults::ROTATION)?;
+    let posdwn = real_of(&kw, "posdwn", defaults::POSDWN)?;
+    let trefstr = char_of(&kw, "tref", defaults::TREF, WIDTH_DATE)?;
+    let tstartstr = char_of(&kw, "tstart", defaults::TREF, WIDTH_DATE)?;
+    let tstopstr = char_of(&kw, "tstop", defaults::TREF, WIDTH_DATE)?;
+    let timestep = real_of(&kw, "timestep", defaults::TIMESTEP)?;
+    let niter = int_of(&kw, "niter", defaults::NITER)?;
+    let crit = real_of(&kw, "crit", defaults::CRIT)?;
+    let dt = real_of(&kw, "dt", defaults::DT)?;
+    let gamma = real_of(&kw, "gamma", defaults::GAMMA)?;
+    let alpha = real_of(&kw, "alpha", defaults::ALPHA)?;
+    let hmin = real_of(&kw, "hmin", defaults::HMIN)?;
+    let gammax = real_of(&kw, "gammax", defaults::GAMMAX)?;
+    let gridfile = char_of(&kw, "gridfile", defaults::GRIDFILE, WIDTH_FILENAME)?;
+    let sferic = int_of(&kw, "sferic", defaults::SFERIC)?;
+    let fwstr = char_of(&kw, "fw", defaults::FW, WIDTH_VALUE_STR)?;
+    let fw_igstr = char_of(&kw, "fwig", defaults::FW_IG, WIDTH_VALUE_STR)?;
+    let fwcutoff = real_of(&kw, "fwcutoff", defaults::FWCUTOFF)?;
+    let tol = real_of(&kw, "tol", defaults::TOL)?;
+    let dtheta = real_of(&kw, "dtheta", defaults::DTHETA)?;
+    let sector = real_of(&kw, "sector", defaults::SECTOR)?;
     let jonswapfile = char_of(&kw, "jonswapfile", "", WIDTH_FILENAME)?;
     let windlistfile = char_of(&kw, "windlistfile", "", WIDTH_FILENAME)?;
-    let bndfile = char_of(&kw, "bndfile", "none", WIDTH_FILENAME)?;
-    let encfile = char_of(&kw, "encfile", "none", WIDTH_FILENAME)?;
-    let neumannfile = char_of(&kw, "neumannfile", "none", WIDTH_FILENAME)?;
+    let bndfile = char_of(&kw, "bndfile", defaults::BNDFILE, WIDTH_FILENAME)?;
+    let encfile = char_of(&kw, "encfile", defaults::ENCFILE, WIDTH_FILENAME)?;
+    let neumannfile = char_of(&kw, "neumannfile", defaults::NEUMANNFILE, WIDTH_FILENAME)?;
     let bhsfile = char_of(&kw, "bhsfile", "", WIDTH_FILENAME)?;
     let btpfile = char_of(&kw, "btpfile", "", WIDTH_FILENAME)?;
     let bwdfile = char_of(&kw, "bwdfile", "", WIDTH_FILENAME)?;
@@ -373,24 +441,25 @@ pub fn parse_str(text: &str) -> Result<SnapWaveInput> {
     let mskfile = char_of(&kw, "mskfile", "", WIDTH_FILENAME)?;
     let indfile = char_of(&kw, "indfile", "", WIDTH_FILENAME)?;
     let depfile = char_of(&kw, "depfile", "", WIDTH_FILENAME)?;
-    let obsfile = char_of(&kw, "obsfile", "none", WIDTH_FILENAME)?;
+    let obsfile = char_of(&kw, "obsfile", defaults::OBSFILE, WIDTH_FILENAME)?;
     let map_filename = char_of(&kw, "map_file", "", WIDTH_FILENAME)?;
     let his_filename = char_of(&kw, "his_file", "", WIDTH_FILENAME)?;
     let map_interval = real_of(&kw, "map_interval", timestep)?;
     let his_interval = real_of(&kw, "his_interval", timestep)?;
     // The two `stop 1` checks of read_snapwave_input, made Rust errors so
-    // the wrapper fails before the Fortran core is ever invoked.
+    // the wrapper fails before the Fortran core is ever invoked
+    // (plan.md Phase 4, step 2).
     if !map_filename.is_empty() && map_interval <= 0.0 {
         bail!("map_interval must be positive. (keyword 'map_interval' with map_file = '{map_filename}')");
     }
     if !his_filename.is_empty() && his_interval <= 0.0 {
         bail!("his_interval must be positive. (keyword 'his_interval' with his_file = '{his_filename}')");
     }
-    let map_dep = int_of(&kw, "map_depth", 1)?;
-    let map_Hm0 = int_of(&kw, "map_Hm0", 1)?;
+    let map_dep = int_of(&kw, "map_depth", defaults::MAP_DEPTH)?;
+    let map_Hm0 = int_of(&kw, "map_Hm0", defaults::MAP_HM0)?;
     let map_Hig = int_of(&kw, "map_Hig", 0)?;
-    let map_Tp = int_of(&kw, "map_Tp", 1)?;
-    let map_dir = int_of(&kw, "map_dir", 1)?;
+    let map_Tp = int_of(&kw, "map_Tp", defaults::MAP_TP)?;
+    let map_dir = int_of(&kw, "map_dir", defaults::MAP_DIR)?;
     let map_dirspr = int_of(&kw, "map_dirspr", 0)?;
     let map_cg = int_of(&kw, "map_Cg", 0)?;
     let map_Dw = int_of(&kw, "map_Dw", 0)?;
@@ -400,27 +469,26 @@ pub fn parse_str(text: &str) -> Result<SnapWaveInput> {
     let map_sig = int_of(&kw, "map_sig", 0)?;
     let map_u10 = int_of(&kw, "map_u10", 0)?;
     let map_Dveg = int_of(&kw, "map_Dveg", 0)?;
-    let writetestfiles_kw = int_of(&kw, "writetestfiles", 0)?;
+    let writetestfiles_kw = int_of(&kw, "writetestfiles", defaults::WRITETESTFILES)?;
     let ja_save_each_iter = int_of(&kw, "ja_save_each_iter", 0)?;
     let map_ee = int_of(&kw, "map_ee", 0)?;
     let map_ctheta = int_of(&kw, "map_ctheta", 0)?;
-    let irestart = int_of(&kw, "restart", 0)?;
-    let u10str = char_of(&kw, "u10", "0.0", WIDTH_VALUE_STR)?;
-    let u10dirstr = char_of(&kw, "u10dir", "270.0", WIDTH_VALUE_STR)?;
-    let Tpini = real_of(&kw, "Tpini", 1.0)?;
-    let mwind = int_of(&kw, "mwind", 2)?;
+    let irestart = int_of(&kw, "restart", defaults::RESTART)?;
+    let u10str = char_of(&kw, "u10", defaults::U10, WIDTH_VALUE_STR)?;
+    let u10dirstr = char_of(&kw, "u10dir", defaults::U10DIR, WIDTH_VALUE_STR)?;
+    let Tpini = real_of(&kw, "Tpini", defaults::TPINI)?;
+    let mwind = int_of(&kw, "mwind", defaults::MWIND)?;
     // Fortran default expressions: 8.0*atan(1.0)/25.0 and 8.0*atan(1.0)/1.0,
     // evaluated in single precision (real*4) arithmetic.
-    let two_pi_f32 = 8.0f32 * 1.0f32.atan();
-    let sigmin = real_of(&kw, "sigmin", two_pi_f32 / 25.0)?;
-    let sigmax = real_of(&kw, "sigmax", two_pi_f32 / 1.0)?;
-    let jadcgdx = int_of(&kw, "jadcgdx", 1)?;
-    let c_dispT = real_of(&kw, "c_dispT", 1.0)?;
-    let zsini = real_of(&kw, "zsini", 0.0)?;
-    let ig = int_of(&kw, "ig", 0)?;
-    let upwindref = int_of(&kw, "upwindref", 0)?;
-    let ja_vegetation = int_of(&kw, "ja_vegetation", 0)?;
-    let vegmapfile = char_of(&kw, "vegmapfile", ".txt", WIDTH_FILENAME)?;
+    let sigmin = real_of(&kw, "sigmin", two_pi_f32() / 25.0)?;
+    let sigmax = real_of(&kw, "sigmax", two_pi_f32() / 1.0)?;
+    let jadcgdx = int_of(&kw, "jadcgdx", defaults::JADCGDX)?;
+    let c_dispT = real_of(&kw, "c_dispT", defaults::C_DISPT)?;
+    let zsini = real_of(&kw, "zsini", defaults::ZSINI)?;
+    let ig = int_of(&kw, "ig", defaults::IG)?;
+    let upwindref = int_of(&kw, "upwindref", defaults::UPWINDREF)?;
+    let ja_vegetation = int_of(&kw, "ja_vegetation", defaults::JA_VEGETATION)?;
+    let vegmapfile = char_of(&kw, "vegmapfile", defaults::VEGMAPFILE, WIDTH_FILENAME)?;
 
     // Wind switch: string comparison against the *parsed* u10 value, so
     // '0.00' (or a file name) turns wind growth on.
@@ -529,6 +597,131 @@ pub fn parse_file(path: &Path) -> Result<SnapWaveInput> {
     let text = std::fs::read_to_string(path)
         .with_context(|| format!("cannot read input file {}", path.display()))?;
     parse_str(&text).with_context(|| format!("invalid input file {}", path.display()))
+}
+
+impl SnapWaveInput {
+    /// Serialize the fully-resolved configuration to the canonical
+    /// `key=value` text consumed by the Fortran facade
+    /// (`read_resolved_input` in `src/snapwave_input.f90`, plan.md
+    /// Phase 4). Keys are the `snapwave_data` global names (matching the
+    /// dump hook in `src/snapwave_c_api.f90`); reals are decimal
+    /// (shortest round-trip, parsed back by Fortran list-directed reads),
+    /// integers decimal, logicals `1`/`0`, strings trimmed.
+    ///
+    /// The text is newline-separated and never contains embedded NUL
+    /// bytes, so it can cross the FFI boundary as a C string.
+    pub fn to_config_text(&self) -> String {
+        let mut out = String::new();
+        let kv = |out: &mut String, key: &str, val: &str| {
+            out.push_str(key);
+            out.push('=');
+            out.push_str(val);
+            out.push('\n');
+        };
+        let fmt_int = |v: i32| v.to_string();
+        let fmt_real4 = |v: f32| v.to_string();
+        let fmt_real8 = |v: f64| v.to_string();
+        let fmt_flag = |v: bool| if v { "1".to_string() } else { "0".to_string() };
+
+        // ---- time / control
+        kv(&mut out, "trefstr", &self.time.tref);
+        kv(&mut out, "tstartstr", &self.time.tstart_str);
+        kv(&mut out, "tstopstr", &self.time.tstop_str);
+        kv(&mut out, "tstart", &fmt_real8(self.time.tstart));
+        kv(&mut out, "tstop", &fmt_real8(self.time.tstop));
+        kv(&mut out, "timestep", &fmt_real4(self.time.timestep));
+        kv(&mut out, "dt", &fmt_real4(self.time.dt));
+        kv(&mut out, "niter", &fmt_int(self.time.niter));
+        kv(&mut out, "crit", &fmt_real4(self.time.crit));
+        kv(&mut out, "restart", &fmt_flag(self.time.restart));
+
+        // ---- grid / domain (mmax/nmax already include the +2 dummy rows)
+        kv(&mut out, "mmax", &fmt_int(self.grid.mmax));
+        kv(&mut out, "nmax", &fmt_int(self.grid.nmax));
+        kv(&mut out, "dx", &fmt_real4(self.grid.dx));
+        kv(&mut out, "dy", &fmt_real4(self.grid.dy));
+        kv(&mut out, "x0", &fmt_real4(self.grid.x0));
+        kv(&mut out, "y0", &fmt_real4(self.grid.y0));
+        kv(&mut out, "rotation", &fmt_real4(self.grid.rotation));
+        kv(&mut out, "posdwn", &fmt_real4(self.grid.posdwn));
+        kv(&mut out, "sferic", &fmt_int(self.grid.sferic));
+        kv(&mut out, "dtheta", &fmt_real4(self.grid.dtheta));
+        kv(&mut out, "sector", &fmt_real4(self.grid.sector));
+        kv(&mut out, "gridfile", &self.grid.gridfile);
+        kv(&mut out, "depfile", &self.grid.depfile);
+        kv(&mut out, "mskfile", &self.grid.mskfile);
+        kv(&mut out, "indfile", &self.grid.indfile);
+        kv(&mut out, "upwfile", &self.grid.upwfile);
+
+        // ---- boundary forcing
+        kv(&mut out, "jonswapfile", &self.boundary.jonswapfile);
+        kv(&mut out, "bndfile", &self.boundary.bndfile);
+        kv(&mut out, "encfile", &self.boundary.encfile);
+        kv(&mut out, "neumannfile", &self.boundary.neumannfile);
+        kv(&mut out, "bhsfile", &self.boundary.bhsfile);
+        kv(&mut out, "btpfile", &self.boundary.btpfile);
+        kv(&mut out, "bwdfile", &self.boundary.bwdfile);
+        kv(&mut out, "bdsfile", &self.boundary.bdsfile);
+        kv(&mut out, "bzsfile", &self.boundary.bzsfile);
+        kv(&mut out, "obsfile", &self.boundary.obsfile);
+        kv(&mut out, "tol", &fmt_real4(self.boundary.tol));
+
+        // ---- wind
+        kv(&mut out, "u10str", &self.wind.u10);
+        kv(&mut out, "u10dirstr", &self.wind.u10dir);
+        kv(&mut out, "windlistfile", &self.wind.windlistfile);
+        kv(&mut out, "mwind", &fmt_int(self.wind.mwind));
+        kv(&mut out, "wind", &fmt_flag(self.wind.enabled));
+
+        // ---- output
+        kv(&mut out, "map_filename", &self.output.map_file);
+        kv(&mut out, "his_filename", &self.output.his_file);
+        kv(&mut out, "map_interval", &fmt_real4(self.output.map_interval));
+        kv(&mut out, "his_interval", &fmt_real4(self.output.his_interval));
+        kv(&mut out, "map_dep", &fmt_int(self.output.map_depth));
+        kv(&mut out, "map_Hm0", &fmt_int(self.output.map_Hm0));
+        kv(&mut out, "map_Hig", &fmt_int(self.output.map_Hig));
+        kv(&mut out, "map_Tp", &fmt_int(self.output.map_Tp));
+        kv(&mut out, "map_dir", &fmt_int(self.output.map_dir));
+        kv(&mut out, "map_dirspr", &fmt_int(self.output.map_dirspr));
+        kv(&mut out, "map_cg", &fmt_int(self.output.map_cg));
+        kv(&mut out, "map_Dw", &fmt_int(self.output.map_Dw));
+        kv(&mut out, "map_Df", &fmt_int(self.output.map_Df));
+        kv(&mut out, "map_SwE", &fmt_int(self.output.map_SwE));
+        kv(&mut out, "map_SwA", &fmt_int(self.output.map_SwA));
+        kv(&mut out, "map_sig", &fmt_int(self.output.map_sig));
+        kv(&mut out, "map_u10", &fmt_int(self.output.map_u10));
+        kv(&mut out, "map_Dveg", &fmt_int(self.output.map_Dveg));
+        kv(&mut out, "map_ee", &fmt_int(self.output.map_ee));
+        kv(&mut out, "map_ctheta", &fmt_int(self.output.map_ctheta));
+        kv(&mut out, "ja_save_each_iter", &fmt_int(self.output.ja_save_each_iter));
+
+        // ---- diagnostics
+        kv(&mut out, "writetestfiles", &fmt_flag(self.diagnostics.writetestfiles));
+
+        // ---- vegetation
+        kv(&mut out, "ja_vegetation", &fmt_int(self.vegetation.ja_vegetation));
+        kv(&mut out, "vegmapfile", &self.vegetation.vegmapfile);
+
+        // ---- solver physics knobs
+        kv(&mut out, "gamma", &fmt_real4(self.physics.gamma));
+        kv(&mut out, "alpha", &fmt_real4(self.physics.alpha));
+        kv(&mut out, "gammax", &fmt_real4(self.physics.gammax));
+        kv(&mut out, "hmin", &fmt_real4(self.physics.hmin));
+        kv(&mut out, "fwcutoff", &fmt_real4(self.physics.fwcutoff));
+        kv(&mut out, "fwstr", &self.physics.fw);
+        kv(&mut out, "fw_igstr", &self.physics.fw_ig);
+        kv(&mut out, "Tpini", &fmt_real4(self.physics.Tpini));
+        kv(&mut out, "zsini", &fmt_real4(self.physics.zsini));
+        kv(&mut out, "sigmin", &fmt_real4(self.physics.sigmin));
+        kv(&mut out, "sigmax", &fmt_real4(self.physics.sigmax));
+        kv(&mut out, "jadcgdx", &fmt_int(self.physics.jadcgdx));
+        kv(&mut out, "c_dispT", &fmt_real4(self.physics.c_dispT));
+        kv(&mut out, "ig", &fmt_int(self.physics.ig));
+        kv(&mut out, "upwindref", &fmt_int(self.physics.upwindref));
+
+        out
+    }
 }
 
 // ----------------------------------------------------------------------
@@ -1159,5 +1352,41 @@ niter = 10
     fn invalid_dates_are_errors() {
         let err = parse_str("tref = notadate\n").expect_err("bad date must fail");
         assert!(format!("{err:#}").contains("notadate"), "error was: {err:#}");
+    }
+
+    #[test]
+    fn to_config_text_has_all_keys_and_round_trips_defaults() {
+        let cfg = parse_str("").expect("default config must parse");
+        let text = cfg.to_config_text();
+        let lines: Vec<&str> = text.lines().collect();
+        assert_eq!(lines.len(), 81, "serialized config must have exactly 81 keys");
+        // Spot-check a few keys from each section.
+        assert!(lines.contains(&"trefstr=20000101 000000"));
+        assert!(lines.contains(&"timestep=3600"));
+        assert!(lines.contains(&"mmax=2"));
+        assert!(lines.contains(&"gridfile=.txt"));
+        assert!(lines.contains(&"bndfile=none"));
+        assert!(lines.contains(&"u10str=0.0"));
+        assert!(lines.contains(&"wind=0"));
+        assert!(lines.contains(&"map_dep=1"));
+        assert!(lines.contains(&"writetestfiles=0"));
+        assert!(lines.contains(&"ja_vegetation=0"));
+        assert!(lines.contains(&"gamma=0.7"));
+        assert!(lines.contains(&"fwstr=0.01"));
+        assert!(lines.contains(&"sigmin=0.25132743"));
+        assert!(lines.contains(&"sigmax=6.2831855"));
+        assert!(lines.contains(&"upwindref=0"));
+        // No embedded NUL bytes.
+        assert!(!text.contains('\0'));
+    }
+
+    #[test]
+    fn to_config_text_serializes_resolved_values() {
+        let cfg = parse_str("mmax = 10\nnmax = 20\nrestart = 1\nwritetestfiles = 1\n").unwrap();
+        let text = cfg.to_config_text();
+        assert!(text.contains("mmax=12")); // +2 dummy rows
+        assert!(text.contains("nmax=22"));
+        assert!(text.contains("restart=1"));
+        assert!(text.contains("writetestfiles=1"));
     }
 }

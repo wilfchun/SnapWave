@@ -180,7 +180,9 @@
               # The checked-in testcase uses Windows path separators
               sed -i 's|\\|/|g' SnapWave.inp
 
-              mkdir -p ../../output
+              # No `mkdir -p ../../output` here: the wrapper owns
+              # output-directory policy and creates missing directories
+              # itself (plan.md Phase 5).
 
               # The wrapper takes the input path as an argument and changes
               # to the input directory itself; a relative argument doubles

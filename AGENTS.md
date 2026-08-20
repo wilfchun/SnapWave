@@ -19,10 +19,11 @@ Rust using a **strangler fig** approach:
 
 Current state: the Cargo-orchestrated wrapper/bootstrap is complete, and
 plan.md Phases 1 (test oracle and baselines), 2 (Rust CLI and run
-context) and 3 (`SnapWave.inp` parsing in Rust, validated against the
-Fortran reader through the temporary `--compare-input` hook) are done.
-Phase 4 (config defaults, validation, and diagnostics) is the active
-frontier.
+context), 3 (`SnapWave.inp` parsing in Rust, validated against the
+Fortran reader through the temporary `--compare-input` hook), 4 (config
+defaults, validation, and diagnostics) and 5 (filesystem and output
+directory handling in Rust) are done. Phase 6 (text input readers) is
+the active frontier.
 
 ## Non-negotiable rules
 
@@ -99,13 +100,16 @@ Environment variables respected by `build.rs`: `FC`, `CC`, `NF_CONFIG`,
 - Testcases are authored on Windows: **normalize `\` → `/` only on temp
   copies** (`cargo test` and the flake check already do this). Never commit
   modified testcase inputs.
-- The wrapper `chdir`s to the input file's parent and passes only the file
-  name across FFI, because the Fortran readers resolve sibling input and
-  output paths relative to the CWD (the input file itself has been
-  Rust-selected and passed explicitly since Phase 3). Preserve this
-  contract until the remaining readers and output handling move to Rust
-  (Phases 5-6). The chdir is isolated in `RunContext::enter_run_dir()`
-  (`src_rust/run_context.rs`) so plan.md Phase 5 can remove it cleanly.
+- The wrapper `chdir`s to the input file's parent before calling the
+  facade, because the Fortran readers resolve sibling input and output
+  file names relative to the CWD (the configuration itself has crossed
+  as resolved text since Phase 4). Output *directories* are Rust-owned
+  since Phase 5 (`src_rust/paths.rs` creates/validates them before the
+  core runs), but the file *names* still resolve CWD-relative in
+  Fortran. Preserve the chdir contract until the remaining readers and
+  the NetCDF IO move to Rust (Phases 6-7). The chdir is isolated in
+  `RunContext::enter_run_dir()` (`src_rust/run_context.rs`) so those
+  phases can remove it cleanly.
 - Existing checks are structural: exit status, output file presence, NetCDF
   headers via `ncdump -h`. **Any change touching output or migrated
   subsystems must extend `tests/mwe.rs`** (or add tests) to cover it.

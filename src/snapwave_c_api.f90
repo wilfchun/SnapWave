@@ -4,7 +4,7 @@ module snapwave_c_api
    !
     ! Exposes the bind(C) entry point snapwave_run_c, which mirrors the
     ! lifecycle of the stand-alone program in src/snapwave.f90:
-   !    1. read input
+   !    1. load the Rust-resolved configuration
    !    2. initialize domain
    !    3. read observation points
    !    4. read boundary conditions (incl. wind if specified)
@@ -14,17 +14,18 @@ module snapwave_c_api
    !
     ! The solver internals and the module global state are unchanged; the
     ! Rust wrapper provides main() and calls this facade. Since plan.md
-    ! Phase 3 the input file itself is Rust-selected and passed down
-    ! explicitly (no more probing of hard-coded file names); all sibling
-    ! input and output files are still resolved by the Fortran readers
-    ! relative to the current working directory, so the caller is expected
-    ! to chdir to the input file's parent directory and pass only the file
-    ! name. The path is validated here as well before the model runs.
+    ! Phase 4 the wrapper resolves the whole configuration in Rust
+    ! (defaults, validation, post-processing) and passes it down as
+    ! canonical key=value text — Fortran no longer reads SnapWave.inp or
+    ! decides defaults on this route. All sibling input and output files
+    ! are still resolved by the Fortran readers relative to the current
+    ! working directory, so the caller is expected to chdir to the input
+    ! file's parent directory before calling.
    !************************************************************************
    use iso_c_binding
    implicit none
 contains
-   function snapwave_run_c(input_path, input_path_len) bind(C, name="snapwave_run_c") result(status)
+   function snapwave_run_c(config, config_len) bind(C, name="snapwave_run_c") result(status)
       use snapwave_data
       use snapwave_input
       use snapwave_domain
@@ -36,34 +37,38 @@ contains
       use omp_lib
       implicit none
 
-      type(c_ptr), value :: input_path
-      integer(c_int), value :: input_path_len
+      type(c_ptr), value :: config
+      integer(c_int), value :: config_len
       integer(c_int) :: status
 
-      character(len=1024) :: fpath
+      character(len=:), allocatable :: ftext
       character(kind=c_char), dimension(:), pointer :: cchars
       real*8  :: t
       real*8  :: output_tol
       integer :: it
       integer :: i
-      logical :: exists
+      integer :: du
+      integer :: ios
 
-      ! Convert C string/path to Fortran character (not NUL terminated;
-      ! the length is passed explicitly).
-      call c_f_pointer(input_path, cchars, [input_path_len])
-      fpath = ' '
-      do i = 1, input_path_len
-         fpath(i:i) = achar(iachar(cchars(i)))
+      ! plan.md Phase 4: the Rust wrapper resolves the entire configuration
+      ! (defaults, validation, post-processing) and passes it here as
+      ! canonical key=value text. Fortran no longer reads SnapWave.inp or
+      ! decides defaults on this route — it only stores what Rust resolved.
+      allocate (character(len=config_len) :: ftext)
+      call c_f_pointer(config, cchars, [config_len])
+      do i = 1, config_len
+         ftext(i:i) = achar(iachar(cchars(i)))
       end do
 
-      inquire (file=trim(fpath), exist=exists)
-      if (.not. exists) then
-         write (*, *) 'ERROR: snapwave_c_api: input file not found: ', trim(fpath)
+      open (newunit=du, status='scratch', action='readwrite', iostat=ios)
+      if (ios /= 0) then
+         write (*, *) 'ERROR: snapwave_c_api: cannot open scratch file for config'
          status = 1_c_int
          return
       end if
-
-       call read_snapwave_input(input_file=trim(fpath)) ! Reads the Rust-selected input file (plan.md Phase 3)
+      call write_config_lines(du, ftext)
+      call read_resolved_input(du)
+      close (du)
       !
       call initialize_snapwave_domain()     ! Read mesh, finds upwind neighbors, etc.
       !
@@ -135,14 +140,17 @@ contains
     end function snapwave_run_c
 
    !************************************************************************
-   ! TEMPORARY Phase 3 comparison hook (plan.md Phase 3, step 5).
-   ! TO BE REMOVED when input parsing is fully Rust-owned (Phase 4+).
+   ! Comparison hooks (plan.md Phase 3 step 5 and Phase 4).
    !
-   ! Parses the input file with the legacy Fortran reader (using the
-   ! Rust-selected file name) and dumps every snapwave_data global that
-   ! read_snapwave_input sets into a canonical key=value text file, so the
-   ! Rust wrapper can compare its own parse result against the Fortran
-   ! oracle. The model is not run.
+   ! Both dumps render the resolved snapwave_data globals as canonical
+   ! key=value text so the Rust wrapper can compare its own parse result
+   ! against the Fortran side:
+   !   - snapwave_read_input_dump_c  parses the input file with the legacy
+   !     Fortran reader (the numerical oracle) and dumps the globals;
+   !   - snapwave_load_config_dump_c  loads the Rust-resolved configuration
+   !     text (read_resolved_input) and dumps the same globals, pinning the
+   !     Phase 4 config handoff.
+   ! The model is not run by either hook.
    !
    ! Dump conventions (mirrored by src_rust/input_compare.rs):
    !   integer   -> decimal (I0)
@@ -166,7 +174,7 @@ contains
 
       character(len=1024) :: fpath, dpath
       character(kind=c_char), dimension(:), pointer :: cchars
-      integer :: i, ios, dunit
+      integer :: i, ios, dunit, istat
       logical :: exists
 
       status = 1_c_int
@@ -190,7 +198,11 @@ contains
          return
       end if
 
-      call read_snapwave_input(input_file=trim(fpath))
+      call read_snapwave_input(input_file=trim(fpath), status=istat)
+      if (istat /= 0) then
+         write (*, *) 'ERROR: snapwave_read_input_dump_c: input reader failed'
+         return
+      end if
 
       open (newunit=dunit, file=trim(dpath), status='replace', action='write', iostat=ios)
       if (ios /= 0) then
@@ -198,108 +210,180 @@ contains
          return
       end if
 
-      ! ---- time / control
-      call dump_char (dunit, 'trefstr', trefstr)
-      call dump_char (dunit, 'tstartstr', tstartstr)
-      call dump_char (dunit, 'tstopstr', tstopstr)
-      call dump_real8(dunit, 'tstart', tstart)
-      call dump_real8(dunit, 'tstop', tstop)
-      call dump_real4(dunit, 'timestep', timestep)
-      call dump_real4(dunit, 'dt', dt)
-      call dump_int  (dunit, 'niter', niter)
-      call dump_real4(dunit, 'crit', crit)
-      call dump_log  (dunit, 'restart', restart)
-
-      ! ---- grid / domain (mmax/nmax already include the +2 dummy rows)
-      call dump_int  (dunit, 'mmax', mmax)
-      call dump_int  (dunit, 'nmax', nmax)
-      call dump_real4(dunit, 'dx', dx)
-      call dump_real4(dunit, 'dy', dy)
-      call dump_real4(dunit, 'x0', x0)
-      call dump_real4(dunit, 'y0', y0)
-      call dump_real4(dunit, 'rotation', rotation)
-      call dump_real4(dunit, 'posdwn', posdwn)
-      call dump_int  (dunit, 'sferic', sferic)
-      call dump_real4(dunit, 'dtheta', dtheta)
-      call dump_real4(dunit, 'sector', sector)
-      call dump_char (dunit, 'gridfile', gridfile)
-      call dump_char (dunit, 'depfile', depfile)
-      call dump_char (dunit, 'mskfile', mskfile)
-      call dump_char (dunit, 'indfile', indfile)
-      call dump_char (dunit, 'upwfile', upwfile)
-
-      ! ---- boundary forcing
-      call dump_char (dunit, 'jonswapfile', jonswapfile)
-      call dump_char (dunit, 'bndfile', bndfile)
-      call dump_char (dunit, 'encfile', encfile)
-      call dump_char (dunit, 'neumannfile', neumannfile)
-      call dump_char (dunit, 'bhsfile', bhsfile)
-      call dump_char (dunit, 'btpfile', btpfile)
-      call dump_char (dunit, 'bwdfile', bwdfile)
-      call dump_char (dunit, 'bdsfile', bdsfile)
-      call dump_char (dunit, 'bzsfile', bzsfile)
-      call dump_char (dunit, 'obsfile', obsfile)
-      call dump_real4(dunit, 'tol', tol)
-
-      ! ---- wind
-      call dump_char (dunit, 'u10str', u10str)
-      call dump_char (dunit, 'u10dirstr', u10dirstr)
-      call dump_char (dunit, 'windlistfile', windlistfile)
-      call dump_int  (dunit, 'mwind', mwind)
-      call dump_int  (dunit, 'wind', wind)
-
-      ! ---- output
-      call dump_char (dunit, 'map_filename', map_filename)
-      call dump_char (dunit, 'his_filename', his_filename)
-      call dump_real4(dunit, 'map_interval', map_interval)
-      call dump_real4(dunit, 'his_interval', his_interval)
-      call dump_int  (dunit, 'map_dep', map_dep)
-      call dump_int  (dunit, 'map_Hm0', map_Hm0)
-      call dump_int  (dunit, 'map_Hig', map_Hig)
-      call dump_int  (dunit, 'map_Tp', map_Tp)
-      call dump_int  (dunit, 'map_dir', map_dir)
-      call dump_int  (dunit, 'map_dirspr', map_dirspr)
-      call dump_int  (dunit, 'map_cg', map_cg)
-      call dump_int  (dunit, 'map_Dw', map_Dw)
-      call dump_int  (dunit, 'map_Df', map_Df)
-      call dump_int  (dunit, 'map_SwE', map_SwE)
-      call dump_int  (dunit, 'map_SwA', map_SwA)
-      call dump_int  (dunit, 'map_sig', map_sig)
-      call dump_int  (dunit, 'map_u10', map_u10)
-      call dump_int  (dunit, 'map_Dveg', map_Dveg)
-      call dump_int  (dunit, 'map_ee', map_ee)
-      call dump_int  (dunit, 'map_ctheta', map_ctheta)
-      call dump_int  (dunit, 'ja_save_each_iter', ja_save_each_iter)
-
-      ! ---- diagnostics
-      call dump_log  (dunit, 'writetestfiles', writetestfiles)
-
-      ! ---- vegetation
-      call dump_int  (dunit, 'ja_vegetation', ja_vegetation)
-      call dump_char (dunit, 'vegmapfile', vegmapfile)
-
-      ! ---- solver physics knobs
-      call dump_real4(dunit, 'gamma', gamma)
-      call dump_real4(dunit, 'alpha', alpha)
-      call dump_real4(dunit, 'gammax', gammax)
-      call dump_real4(dunit, 'hmin', hmin)
-      call dump_real4(dunit, 'fwcutoff', fwcutoff)
-      call dump_char (dunit, 'fwstr', fwstr)
-      call dump_char (dunit, 'fw_igstr', fw_igstr)
-      call dump_real4(dunit, 'Tpini', Tpini)
-      call dump_real4(dunit, 'zsini', zsini)
-      call dump_real4(dunit, 'sigmin', sigmin)
-      call dump_real4(dunit, 'sigmax', sigmax)
-      call dump_int  (dunit, 'jadcgdx', jadcgdx)
-      call dump_real4(dunit, 'c_dispT', c_dispT)
-      call dump_int  (dunit, 'ig', ig)
-      call dump_int  (dunit, 'upwindref', upwindref)
+      call dump_globals(dunit)
 
       close (dunit)
       !
       status = 0_c_int
       !
    end function snapwave_read_input_dump_c
+
+   !************************************************************************
+   ! plan.md Phase 4 hook: load the Rust-resolved configuration text and
+   ! dump the resulting globals, so `--compare-input` can pin that the
+   ! config handoff (Rust -> text -> Fortran globals) round-trips exactly.
+   !************************************************************************
+   function snapwave_load_config_dump_c(config, config_len, dump_path, dump_path_len) &
+         bind(C, name="snapwave_load_config_dump_c") result(status)
+      use snapwave_data
+      use snapwave_input
+      implicit none
+
+      type(c_ptr), value :: config
+      integer(c_int), value :: config_len
+      type(c_ptr), value :: dump_path
+      integer(c_int), value :: dump_path_len
+      integer(c_int) :: status
+
+      character(len=:), allocatable :: ftext
+      character(len=1024) :: dpath
+      character(kind=c_char), dimension(:), pointer :: cchars
+      integer :: i, ios, dunit, du
+
+      status = 1_c_int
+
+      allocate (character(len=config_len) :: ftext)
+      call c_f_pointer(config, cchars, [config_len])
+      do i = 1, config_len
+         ftext(i:i) = achar(iachar(cchars(i)))
+      end do
+      call c_f_pointer(dump_path, cchars, [dump_path_len])
+      dpath = ' '
+      do i = 1, dump_path_len
+         dpath(i:i) = achar(iachar(cchars(i)))
+      end do
+
+      open (newunit=du, status='scratch', action='readwrite', iostat=ios)
+      if (ios /= 0) then
+         write (*, *) 'ERROR: snapwave_load_config_dump_c: cannot open scratch file for config'
+         return
+      end if
+      call write_config_lines(du, ftext)
+      call read_resolved_input(du)
+      close (du)
+
+      open (newunit=dunit, file=trim(dpath), status='replace', action='write', iostat=ios)
+      if (ios /= 0) then
+         write (*, *) 'ERROR: snapwave_load_config_dump_c: cannot open dump file: ', trim(dpath)
+         return
+      end if
+
+      call dump_globals(dunit)
+
+      close (dunit)
+      !
+      status = 0_c_int
+      !
+   end function snapwave_load_config_dump_c
+
+   subroutine dump_globals(u)
+      !
+      ! Dump every snapwave_data global that the input readers set, in the
+      ! canonical key=value format (see the module docs). Shared by both
+      ! comparison hooks so the two dumps stay in lock-step.
+      !
+      use snapwave_data
+      implicit none
+      integer, intent(in) :: u
+      !
+      ! ---- time / control
+      call dump_char (u, 'trefstr', trefstr)
+      call dump_char (u, 'tstartstr', tstartstr)
+      call dump_char (u, 'tstopstr', tstopstr)
+      call dump_real8(u, 'tstart', tstart)
+      call dump_real8(u, 'tstop', tstop)
+      call dump_real4(u, 'timestep', timestep)
+      call dump_real4(u, 'dt', dt)
+      call dump_int  (u, 'niter', niter)
+      call dump_real4(u, 'crit', crit)
+      call dump_log  (u, 'restart', restart)
+
+      ! ---- grid / domain (mmax/nmax already include the +2 dummy rows)
+      call dump_int  (u, 'mmax', mmax)
+      call dump_int  (u, 'nmax', nmax)
+      call dump_real4(u, 'dx', dx)
+      call dump_real4(u, 'dy', dy)
+      call dump_real4(u, 'x0', x0)
+      call dump_real4(u, 'y0', y0)
+      call dump_real4(u, 'rotation', rotation)
+      call dump_real4(u, 'posdwn', posdwn)
+      call dump_int  (u, 'sferic', sferic)
+      call dump_real4(u, 'dtheta', dtheta)
+      call dump_real4(u, 'sector', sector)
+      call dump_char (u, 'gridfile', gridfile)
+      call dump_char (u, 'depfile', depfile)
+      call dump_char (u, 'mskfile', mskfile)
+      call dump_char (u, 'indfile', indfile)
+      call dump_char (u, 'upwfile', upwfile)
+
+      ! ---- boundary forcing
+      call dump_char (u, 'jonswapfile', jonswapfile)
+      call dump_char (u, 'bndfile', bndfile)
+      call dump_char (u, 'encfile', encfile)
+      call dump_char (u, 'neumannfile', neumannfile)
+      call dump_char (u, 'bhsfile', bhsfile)
+      call dump_char (u, 'btpfile', btpfile)
+      call dump_char (u, 'bwdfile', bwdfile)
+      call dump_char (u, 'bdsfile', bdsfile)
+      call dump_char (u, 'bzsfile', bzsfile)
+      call dump_char (u, 'obsfile', obsfile)
+      call dump_real4(u, 'tol', tol)
+
+      ! ---- wind
+      call dump_char (u, 'u10str', u10str)
+      call dump_char (u, 'u10dirstr', u10dirstr)
+      call dump_char (u, 'windlistfile', windlistfile)
+      call dump_int  (u, 'mwind', mwind)
+      call dump_int  (u, 'wind', wind)
+
+      ! ---- output
+      call dump_char (u, 'map_filename', map_filename)
+      call dump_char (u, 'his_filename', his_filename)
+      call dump_real4(u, 'map_interval', map_interval)
+      call dump_real4(u, 'his_interval', his_interval)
+      call dump_int  (u, 'map_dep', map_dep)
+      call dump_int  (u, 'map_Hm0', map_Hm0)
+      call dump_int  (u, 'map_Hig', map_Hig)
+      call dump_int  (u, 'map_Tp', map_Tp)
+      call dump_int  (u, 'map_dir', map_dir)
+      call dump_int  (u, 'map_dirspr', map_dirspr)
+      call dump_int  (u, 'map_cg', map_cg)
+      call dump_int  (u, 'map_Dw', map_Dw)
+      call dump_int  (u, 'map_Df', map_Df)
+      call dump_int  (u, 'map_SwE', map_SwE)
+      call dump_int  (u, 'map_SwA', map_SwA)
+      call dump_int  (u, 'map_sig', map_sig)
+      call dump_int  (u, 'map_u10', map_u10)
+      call dump_int  (u, 'map_Dveg', map_Dveg)
+      call dump_int  (u, 'map_ee', map_ee)
+      call dump_int  (u, 'map_ctheta', map_ctheta)
+      call dump_int  (u, 'ja_save_each_iter', ja_save_each_iter)
+
+      ! ---- diagnostics
+      call dump_log  (u, 'writetestfiles', writetestfiles)
+
+      ! ---- vegetation
+      call dump_int  (u, 'ja_vegetation', ja_vegetation)
+      call dump_char (u, 'vegmapfile', vegmapfile)
+
+      ! ---- solver physics knobs
+      call dump_real4(u, 'gamma', gamma)
+      call dump_real4(u, 'alpha', alpha)
+      call dump_real4(u, 'gammax', gammax)
+      call dump_real4(u, 'hmin', hmin)
+      call dump_real4(u, 'fwcutoff', fwcutoff)
+      call dump_char (u, 'fwstr', fwstr)
+      call dump_char (u, 'fw_igstr', fw_igstr)
+      call dump_real4(u, 'Tpini', Tpini)
+      call dump_real4(u, 'zsini', zsini)
+      call dump_real4(u, 'sigmin', sigmin)
+      call dump_real4(u, 'sigmax', sigmax)
+      call dump_int  (u, 'jadcgdx', jadcgdx)
+      call dump_real4(u, 'c_dispT', c_dispT)
+      call dump_int  (u, 'ig', ig)
+      call dump_int  (u, 'upwindref', upwindref)
+      !
+   end subroutine dump_globals
 
    subroutine dump_int(u, key, val)
       !
