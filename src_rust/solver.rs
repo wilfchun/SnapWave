@@ -44,14 +44,49 @@ use std::f32::consts::PI as PI_F32;
 
 /// Water density [kg/m³] — `snapwave_data::rho`.
 pub const RHO: f32 = 1025.0;
-/// Gravitational acceleration [m/s²] — `snapwave_data::g`.
+/// Gravitational acceleration [m/s²] — `snapwave_data::g` (used by
+/// `compute_wave_field` for celerities/refraction speed).
 pub const G: f32 = 9.813;
+/// Gravitational acceleration used *inside* `solve_energy_balance2Dstat`:
+/// the Fortran routine declares its own local `g = 9.81` parameter (distinct
+/// from the module `g = 9.813`), so the two must not be collapsed.
+pub const G_SOLVER: f32 = 9.81;
 /// π in single precision — `snapwave_data::pi`.
 pub const PI: f32 = PI_F32;
 /// Degrees to radians — `snapwave_data::deg2rad`.
 pub const DEG2RAD: f32 = PI_F32 / 180.0;
 /// Radians to degrees — `snapwave_data::rad2deg`.
 pub const RAD2DEG: f32 = 180.0 / PI_F32;
+
+/// A snapshot of the solver state at one per-iteration map output point
+/// (`ja_save_each_iter == 1`). Enough for the model to build one
+/// [`crate::capture::MapRecord`]; the static fields (depth, `theta`, wind)
+/// are already owned by the model.
+#[derive(Clone, Debug, Default)]
+pub struct IterSnapshot {
+    pub h: Vec<f32>,
+    pub thetam: Vec<f32>,
+    pub df: Vec<f32>,
+    pub dw: Vec<f32>,
+    pub f: Vec<f32>,
+    pub h_ig: Vec<f32>,
+    pub tp: Vec<f32>,
+    pub sig: Vec<f32>,
+    pub swe: Vec<f32>,
+    pub swa: Vec<f32>,
+    pub ee: Vec<f32>,
+    pub ctheta: Vec<f32>,
+    pub cg: Vec<f32>,
+}
+
+/// One per-iteration map output event: the record index (`ntmapout`, the
+/// Fortran `iter`) and the output time (`time + iter`).
+#[derive(Clone, Debug)]
+pub struct IterOutput {
+    pub ntmapout: i32,
+    pub time: f64,
+    pub snapshot: IterSnapshot,
+}
 
 // ---------------------------------------------------------------------------
 // 1. solve_tridiag — Thomas algorithm
@@ -664,6 +699,9 @@ pub fn compute_wave_field(
     neumannconnected: &[i32],
     theta: &[f32],
     thetamean: f32,
+    // Mean boundary wave period (`tpmean_bwv`), used for the Fortran
+    // `Tp = max(tpmean_bwv, Tpini)` broadcast to every node.
+    tpmean_bwv: f32,
     depth: &[f32],
     fw: &[f32],
     fw_ig: &[f32],
@@ -724,6 +762,8 @@ pub fn compute_wave_field(
     // Forces
     fx: &mut [f32],
     fy: &mut [f32],
+    // Per-iteration map output sink (ja_save_each_iter == 1)
+    iter_outputs: &mut Vec<IterOutput>,
 ) {
     let waveps: f32 = 1e-5;
     let g = G;
@@ -757,13 +797,10 @@ pub fn compute_wave_field(
         }
     }
 
-    // Compute celerities and refraction speed
-    // tpmean_bwv is not available here; the Fortran does Tp = max(tpmean_bwv, Tpini)
-    // but tpmean_bwv is set in update_boundary_conditions. We assume it's already
-    // been applied to tp by the caller or is handled in the boundary update.
-    // For the port, we just ensure tp >= tpini.
+    // Fortran: `Tp = max(tpmean_bwv, Tpini)` broadcast to every node
+    // (tpmean_bwv is the mean boundary period from update_boundary_conditions).
     for k in 0..no_nodes {
-        tp[k] = tp[k].max(tpini);
+        tp[k] = tpmean_bwv.max(tpini);
     }
 
     for k in 0..no_nodes {
@@ -823,7 +860,7 @@ pub fn compute_wave_field(
         niter, crit, upwindref, aa, sig, jadcgdx, sigmin, sigmax, c_dispt, wsor_e, wsor_a,
         swe, swa, tpini, ig, kwav_ig_in, cg_ig_in, h_ig_out, ctheta_ig_in, hmx_ig_in,
         ee_ig, fw_ig, time, ja_save_each_iter, ja_vegetation, no_secveg, veg_ah,
-        veg_bstems, veg_nstems, veg_cd, dveg_out,
+        veg_bstems, veg_nstems, veg_cd, dveg_out, iter_outputs,
     );
 
     // Wave forces
@@ -900,6 +937,8 @@ pub fn solve_energy_balance2Dstat(
     swa: &mut [f32],
     tpini: f32,
     ig: i32,
+    // kwav_ig is not read in the port (Hmx_ig is passed in by the caller);
+    // keep the parameter for call-site symmetry with the Fortran signature.
     _kwav_ig: &[f32],
     cg_ig: &[f32],
     h_ig_out: &mut [f32],
@@ -907,8 +946,8 @@ pub fn solve_energy_balance2Dstat(
     hmx_ig: &[f32],
     ee_ig: &mut [f32],
     fw_ig: &[f32],
-    _time: f64,
-    _ja_save_each_iter: i32,
+    time: f64,
+    ja_save_each_iter: i32,
     ja_vegetation: i32,
     no_secveg: usize,
     veg_ah: &[f32],
@@ -916,8 +955,11 @@ pub fn solve_energy_balance2Dstat(
     veg_nstems: &[f32],
     veg_cd: &[f32],
     dveg_out: &mut [f32],
+    iter_outputs: &mut Vec<IterOutput>,
 ) {
-    let g = G;
+    // Note: the Fortran `solve_energy_balance2Dstat` declares a *local*
+    // `g = 9.81` (not the module `g = 9.813`), and a local `pi`.
+    let g = G_SOLVER;
     let pi = PI_F32;
     let hmin: f32 = 0.1;
     let fac: f32 = 1.0; // underrelaxation factor for DoverA
@@ -1036,12 +1078,20 @@ pub fn solve_energy_balance2Dstat(
     };
 
     // ---- Sort coordinates in sweep directions ----
+    // Fortran `ra(k) = x(k)*cos(thetamean + 0.5*pi*shift) + y(k)*sin(...)`:
+    // x,y are real*8, the angle/cos/sin are real*4, so the product is
+    // real*8 and only the final `ra` is truncated to real*4. Truncating
+    // x,y to f32 first (as an earlier port did) shifts the sort key by a
+    // few ulp, which flips the order of near-tied points and changes the
+    // per-iteration intermediate states saved by `ja_save_each_iter`.
     let shift = [0i32, 1, -1, 2];
     for sweep in 0..4usize {
         let sweep_idx = sweep;
+        let angle = thetamean + 0.5 * pi * shift[sweep_idx] as f32;
+        let cosang = angle.cos();
+        let sinang = angle.sin();
         for k in 0..no_nodes {
-            ra[k] = (x[k] as f32) * (thetamean + 0.5 * pi * shift[sweep_idx] as f32).cos()
-                + (y[k] as f32) * (thetamean + 0.5 * pi * shift[sweep_idx] as f32).sin();
+            ra[k] = (x[k] * cosang as f64 + y[k] * sinang as f64) as f32;
         }
         let col_start = sweep_idx * no_nodes;
         hpsort_eps_epw(no_nodes, &mut ra, &mut indx[col_start..col_start + no_nodes], 1.0e-6);
@@ -1646,6 +1696,65 @@ pub fn solve_energy_balance2Dstat(
             if error < crit {
                 break;
             }
+        }
+
+        // ---- Per-iteration map output (ja_save_each_iter == 1) ----
+        // Mirrors the Fortran block at the end of each sweep iteration:
+        // recompute H/thetam/Df/Dw/F/H_ig/Tp/SwE/SwA from the current ee,
+        // then emit a map record at time+iter with index iter.
+        if ja_save_each_iter == 1 {
+            let mut h_snap = vec![0.0f32; no_nodes];
+            let mut thetam_snap = vec![0.0f32; no_nodes];
+            let mut df_snap = vec![0.0f32; no_nodes];
+            let mut dw_snap = vec![0.0f32; no_nodes];
+            let mut f_snap = vec![0.0f32; no_nodes];
+            let mut h_ig_snap = vec![0.0f32; no_nodes];
+            let mut tp_snap = tp.to_vec();
+            let mut swe_snap = vec![0.0f32; no_nodes];
+            let mut swa_snap = vec![0.0f32; no_nodes];
+
+            for k in 0..no_nodes {
+                let ek = ee.iter().skip(k * ntheta).take(ntheta).sum::<f32>() * dtheta;
+                let _ak = aa.iter().skip(k * ntheta).take(ntheta).sum::<f32>() * dtheta;
+                h_snap[k] = (8.0 * ek / rho / g).sqrt();
+                let sum_sin: f32 = (0..ntheta).map(|i| ee[i + k * ntheta] * sinth[i]).sum();
+                let sum_cos: f32 = (0..ntheta).map(|i| ee[i + k * ntheta] * costh[i]).sum();
+                thetam_snap[k] = sum_sin.atan2(sum_cos);
+                let uorbi = 0.5 * sig[k] * h_snap[k] / sinhkh[k];
+                df_snap[k] = 0.28 * rho * fw[k] * uorbi.powi(3);
+                dw_snap[k] = baldock(rho, g, alfa, gamma, depth[k], h_snap[k], tp_snap[k], 1, hmx[k]);
+                f_snap[k] = dw_snap[k] * kwav[k] / sig[k] / rho / depth[k];
+
+                if ig == 1 {
+                    let ek_ig = ee_ig.iter().skip(k * ntheta).take(ntheta).sum::<f32>() * dtheta;
+                    h_ig_snap[k] = (8.0 * ek_ig / rho / g).sqrt();
+                }
+                if wind == 1 {
+                    tp_snap[k] = 2.0 * pi / sig[k];
+                    swe_snap[k] = wsor_e.iter().skip(k * ntheta).take(ntheta).sum::<f32>() * dtheta;
+                    swa_snap[k] = wsor_a.iter().skip(k * ntheta).take(ntheta).sum::<f32>() * dtheta;
+                }
+            }
+
+            iter_outputs.push(IterOutput {
+                ntmapout: iter,
+                time: time + iter as f64,
+                snapshot: IterSnapshot {
+                    h: h_snap,
+                    thetam: thetam_snap,
+                    df: df_snap,
+                    dw: dw_snap,
+                    f: f_snap,
+                    h_ig: h_ig_snap,
+                    tp: tp_snap,
+                    sig: sig.to_vec(),
+                    swe: swe_snap,
+                    swa: swa_snap,
+                    ee: ee.to_vec(),
+                    ctheta: ctheta.to_vec(),
+                    cg: cg.to_vec(),
+                },
+            });
         }
     }
 

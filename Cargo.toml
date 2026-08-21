@@ -2,11 +2,14 @@
 name = "snapwave"
 version = "0.1.0"
 edition = "2021"
-build = "build.rs"
+build = false
 
-# Rust wrapper around the existing Fortran core. The binary provides `main`,
-# calls the Fortran solver through the coarse C ABI facade in
-# src/snapwave_c_api.f90 and links against the original Fortran/C objects.
+# plan.md Phase 12: the model is 100% Rust. Cargo no longer compiles the
+# Fortran core, the bundled Triangle C code, or links NetCDF/Fortran
+# runtimes — the `build.rs` orchestrator and the `cc` build dependency are
+# gone (`build = false` keeps the retired `build.rs` stub from being
+# auto-detected as a build script). The legacy `make` build remains
+# available as the numerical oracle (see `flake.nix` `snapwave-legacy`).
 
 [[bin]]
 name = "snapwave"
@@ -14,6 +17,3 @@ path = "src_rust/main.rs"
 
 [dependencies]
 anyhow = "1"
-
-[build-dependencies]
-cc = "1"

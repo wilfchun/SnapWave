@@ -810,6 +810,66 @@ Acceptance:
 - The final parity report records tolerances, tested cases, and any intentional
   deviations.
 
+Status: implemented (2026-08-21). The last Fortran runtime authority — the
+boundary-condition update (`update_boundary_points`, `update_wind_field`,
+`make_theta_grid`, `build_boundary_support_points_spectra`,
+`update_boundaries`), the observation-point update (`update_obs_points`)
+and the directionally integrated output (`directional_spreading`) — is
+ported into `src_rust/model.rs`, which also wires the Phase 9 geometry
+(surrounding points, upwind neighbours, mask/Neumann refinement, boundary
+support-point mapping, observation weights) and the Phase 11 solver into
+one Rust-owned model run. `execute()` (`src_rust/main.rs`) now reads the
+mesh, builds the `Model`, and drives the time loop entirely in Rust; the
+`ja_save_each_iter` per-sweep map output is reproduced through a new
+`IterOutput` snapshot path in `solver.rs`.
+
+Step 1: `build.rs` is retired to a stub and `Cargo.toml` no longer sets
+`build = "build.rs"` or the `cc` build dependency — nothing compiles or
+links Fortran/C/NetCDF. Step 2: the `Makefile` (and `flake.nix`
+`snapwave-legacy`) remain as the numerical oracle. Step 3:
+`src/snapwave_c_api.f90` is removed (no Rust runtime path calls Fortran).
+Step 4: `flake.nix` builds the pure-Rust binary with no foreign toolchain.
+Step 5: README.md, AGENTS.md and tests/README.md updated. Step 6: the
+parity report below.
+
+### Phase 12 parity report
+
+Tolerances: per-variable in `tests/support/compare.rs` (unchanged from
+Phase 1; see tests/README.md). The `Build-Revision-Date-Netcdf-library`
+attribute is excluded from schema comparison (the Rust writer records
+"Rust classic-format writer (no NetCDF library)" where Fortran embeds
+`nf90_inq_libvers()`).
+
+Tested cases: the MWE (31 linear shoaling/refraction, coarse — boundary
+time series + enclosure + Neumann + obs points) and case 32 (curvilinear
+island, single-point JONSWAP, `ja_save_each_iter = 1` per-iteration map
+output), compared against the committed baselines and the live `make`
+oracle by `tests/regression.rs`; case 31 is also exercised structurally
+by `tests/mwe.rs`, `tests/cli.rs`, `tests/output_dirs.rs` and the flake
+smoke test.
+
+Intentional deviations (documented in `src_rust/model.rs`; none reachable
+for checked-in testcases — the Rust build rejects them with a clear error
+rather than silently diverging):
+
+- Structured index/mask and ASCII meshes are not supported (the Rust mesh
+  reader is NetCDF-only; the Fortran readers stay in the oracle).
+- File-backed `fw`/`fwig`/`u10`/`u10dir` interpolation
+  (`read_interpolate_map_input` → `triintfast`/Triangle/`kdtree2`) stays
+  Fortran.
+- `windlistfile` (wind time series) stays Fortran.
+- `ja_vegetation = 1` (vegetation NetCDF reader) stays Fortran.
+- OpenMP parallel sections are not ported: the Rust solver is scalar-only
+  (scalar parity first, per the plan.md rule).
+- `ig = 1` (infragravity) arrays are wired as zero — no checked-in case
+  exercises them, so the Fortran `ig` path is not numerically pinned.
+
+Acceptance verified: `cargo build` compiles only `src_rust/` (the
+`src/`/`utils_lgpl/`/`third_party_open/` trees and NetCDF are not in the
+Cargo build), and `cargo test` runs the smoke, regression and CLI tests
+against the pure-Rust binary; `make` still builds the unchanged Fortran
+oracle, which the regression suite uses when present (`SNAPWAVE_ORACLE`).
+
 ## Ongoing Workstreams
 
 Regression coverage:
@@ -823,8 +883,9 @@ Regression coverage:
 
 Build and packaging:
 
-- Keep `Makefile` and `build.rs` source ordering synchronized while Fortran is
-  compiled by both systems.
+- Fortran is no longer compiled by the Cargo build (Phase 12); the
+  `Makefile` is the sole Fortran build and its source ordering only needs
+  to stay internally consistent (the oracle).
 - Make Nix build the same executable path used by Cargo migration tests.
 - Avoid changing bundled third-party code except for build integration.
 

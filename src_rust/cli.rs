@@ -4,19 +4,14 @@
 //! handful of flags, and the repo style keeps runtime dependencies minimal
 //! (`clap` is only warranted once argument parsing genuinely grows).
 //!
-//! Status-code contract (kept consistent with the pre-Phase-2 wrapper and
-//! AGENTS.md):
+//! Status-code contract:
 //!   * `0` — success (`--help`, `--version`, or a model run reporting 0);
 //!   * [`EXIT_USAGE`] (2) — wrapper-detected errors: bad arguments, an
-//!     unusable input path, failure to enter the run directory;
-//!   * any other non-zero code — a Fortran model status, passed through
-//!     unchanged by `main`.
+//!     unusable input path, or a model run failing in Rust.
 //!
 //! Parsing works on OS strings, not `String`: arguments that are not valid
 //! UTF-8 must produce a clean usage error, never a panic (plan.md Phase 2,
-//! step 4). Embedded NUL bytes cannot reach this code through `execve` on
-//! the supported platforms; the FFI-side name conversion still guards
-//! against them (see `run_context.rs`).
+//! step 4).
 
 use std::ffi::{OsStr, OsString};
 use std::path::PathBuf;
@@ -24,7 +19,7 @@ use std::path::PathBuf;
 /// Exit code for wrapper-detected (usage/validation) errors.
 pub const EXIT_USAGE: i32 = 2;
 
-/// The input file the Fortran core expects (used in help/error text).
+/// The input file the model core expects (used in help/error text).
 const INPUT_FILE_HINT: &str = "SnapWave.inp";
 
 /// What the user asked the wrapper to do.
@@ -36,28 +31,6 @@ pub enum Invocation {
     Version(String),
     /// Run a model.
     Run(RunCommand),
-    /// Parse the input in Rust, compare against the legacy Fortran reader
-    /// through the temporary Phase 3 hook, and exit without running the
-    /// model (plan.md Phase 3, step 5; removed again in Phase 4+).
-    CompareInput(RunCommand),
-    /// Parse the auxiliary text inputs in Rust, compare against the
-    /// Fortran readers through the temporary Phase 6 hook, and exit
-    /// without running the model (plan.md Phase 6, step 2).
-    CompareText(RunCommand),
-    /// Read the mesh NetCDF in Rust, compare against the unchanged Fortran
-    /// `nc_read_net` reader through the temporary Phase 7 hook, and exit
-    /// without running the model (plan.md Phase 7, step 2).
-    CompareMesh(RunCommand),
-    /// Compute the derived geometry (surrounding points, upwind neighbours,
-    /// observation interpolation weights, boundary support-point mapping) in
-    /// Rust, compare against the unchanged Fortran routines through the
-    /// temporary Phase 9 hook, and exit without running the model (plan.md
-    /// Phase 9).
-    CompareGeometry(RunCommand),
-    /// Run the unchanged Fortran solver for one timestep, compare against
-    /// the Rust solver port through the temporary Phase 11 hook, and exit
-    /// without running the model (plan.md Phase 11).
-    CompareSolver(RunCommand),
 }
 
 /// A requested model run, still unvalidated: input validation happens when
@@ -68,17 +41,6 @@ pub struct RunCommand {
     pub input: PathBuf,
     /// Logging preference: print the run context before starting the model.
     pub verbose: bool,
-    /// Test hook (plan.md Phase 8 parity check, `tests/domain_state.rs`):
-    /// let the Fortran core read the mesh/text inputs itself instead of
-    /// consuming the Rust-owned state. Not advertised in `--help` — it
-    /// exists to pin the state handoff against the unchanged Fortran
-    /// readers without requiring the `make`-built oracle.
-    pub legacy_mesh: bool,
-    /// Test hook (plan.md Phase 10 parity check): force the old
-    /// Fortran-owned time loop (`snapwave_run_capture_c` /
-    /// `snapwave_run_capture_state_c`) instead of the Rust-owned loop.
-    /// Not advertised in `--help`.
-    pub fortran_time_loop: bool,
 }
 
 /// Parse `args` (including `argv[0]`) into an [`Invocation`].
@@ -91,13 +53,6 @@ pub fn parse(args: &[OsString]) -> Result<Invocation, String> {
     let prog = program_name(args.first());
     let mut input: Option<OsString> = None;
     let mut verbose = false;
-    let mut legacy_mesh = false;
-    let mut fortran_time_loop = false;
-    let mut compare_input = false;
-    let mut compare_text = false;
-    let mut compare_mesh = false;
-    let mut compare_geometry = false;
-    let mut compare_solver = false;
     let mut only_positional = false;
 
     for arg in args.iter().skip(1) {
@@ -115,13 +70,6 @@ pub fn parse(args: &[OsString]) -> Result<Invocation, String> {
                 return Ok(Invocation::Version(version_text()));
             }
             (true, Some("-v")) | (true, Some("--verbose")) => verbose = true,
-            (true, Some("--legacy-mesh")) => legacy_mesh = true,
-            (true, Some("--fortran-time-loop")) => fortran_time_loop = true,
-            (true, Some("--compare-input")) => compare_input = true,
-            (true, Some("--compare-text")) => compare_text = true,
-            (true, Some("--compare-mesh")) => compare_mesh = true,
-            (true, Some("--compare-geometry")) => compare_geometry = true,
-            (true, Some("--compare-solver")) => compare_solver = true,
             (true, Some(other)) => return Err(format!("unknown option: {other}")),
             (true, None) => {
                 return Err(format!("unknown option: {}", arg.to_string_lossy()));
@@ -134,19 +82,8 @@ pub fn parse(args: &[OsString]) -> Result<Invocation, String> {
         }
     }
 
-    let command = |input: OsString| RunCommand {
-        input: PathBuf::from(input),
-        verbose,
-        legacy_mesh,
-        fortran_time_loop,
-    };
     match input {
-        Some(input) if compare_input => Ok(Invocation::CompareInput(command(input))),
-        Some(input) if compare_text => Ok(Invocation::CompareText(command(input))),
-        Some(input) if compare_mesh => Ok(Invocation::CompareMesh(command(input))),
-        Some(input) if compare_geometry => Ok(Invocation::CompareGeometry(command(input))),
-        Some(input) if compare_solver => Ok(Invocation::CompareSolver(command(input))),
-        Some(input) => Ok(Invocation::Run(command(input))),
+        Some(input) => Ok(Invocation::Run(RunCommand { input: PathBuf::from(input), verbose })),
         None => Err(format!("missing input path (expected one {INPUT_FILE_HINT} file)")),
     }
 }
@@ -167,13 +104,12 @@ fn is_flag_arg(arg: &OsStr) -> bool {
 }
 
 pub fn version_text() -> String {
-    format!("snapwave {} (Rust wrapper around the Fortran core)\n", env!("CARGO_PKG_VERSION"))
+    format!("snapwave {} (pure Rust)\n", env!("CARGO_PKG_VERSION"))
 }
 
 pub fn help_text(prog: &str) -> String {
     format!(
-        r#"SnapWave — fast, implicit, unstructured-grid short wave solver
-(Rust wrapper around the Fortran core)
+        r#"SnapWave — fast, implicit, unstructured-grid short wave solver (pure Rust)
 
 Usage: {prog} [OPTIONS] <INPUT>
 
@@ -183,36 +119,15 @@ Arguments:
 
 Options:
   -v, --verbose  Print the run context before starting the model
-  --compare-input  Parse INPUT in Rust and compare the result against the
-                   legacy Fortran reader AND the resolved-config handoff,
-                   then exit without running the model (plan.md Phase 3/4)
-  --compare-text   Parse INPUT and its auxiliary text files (obs points,
-                   boundary, wind, enclosure/neumann) in Rust and compare
-                   against the Fortran readers, then exit without running
-                   the model (plan.md Phase 6)
-  --compare-mesh   Read the mesh NetCDF (gridfile) in Rust and compare
-                   against the unchanged Fortran nc_read_net reader, then
-                   exit without running the model (plan.md Phase 7)
---compare-geometry
-                    Compute the derived geometry (surrounding points, upwind
-                    neighbours, observation weights, boundary support-point
-                    mapping) in Rust and compare against the Fortran
-                    routines, then exit without running the model (plan.md
-                    Phase 9)
-  --compare-solver  Run the unchanged Fortran solver for one timestep and
-                    compare against the Rust solver port, then exit without
-                    running the model (plan.md Phase 11)
   -h, --help     Print this help and exit
   -V, --version  Print version information and exit
 
 The model runs from the input file's directory: the input and output files
-named in SnapWave.inp are resolved by the Fortran core relative to it
-(legacy contract, plan.md Phase 2).
+named in SnapWave.inp are resolved relative to it.
 
 Exit status:
   0  success
   2  invalid arguments or unusable input path (wrapper-detected)
-  N  non-zero Fortran model status, passed through unchanged
 "#
     )
 }
@@ -286,67 +201,6 @@ mod tests {
             Ok(Invocation::Run(cmd)) => assert!(cmd.verbose),
             other => panic!("expected a run, got {other:?}"),
         }
-    }
-
-    #[test]
-    fn compare_input_flag_is_parsed() {
-        match parse(&args(&["--compare-input", "SnapWave.inp"])) {
-            Ok(Invocation::CompareInput(cmd)) => {
-                assert_eq!(cmd.input, PathBuf::from("SnapWave.inp"));
-                assert!(!cmd.verbose);
-            }
-            other => panic!("expected a compare-input invocation, got {other:?}"),
-        }
-        // Still needs the positional input path.
-        let err = parse(&args(&["--compare-input"])).expect_err("input path still required");
-        assert!(err.contains("missing input"), "error was: {err}");
-        // Documented in the help text.
-        assert!(help_text("snapwave").contains("--compare-input"));
-    }
-
-    #[test]
-    fn compare_text_flag_is_parsed() {
-        match parse(&args(&["--compare-text", "SnapWave.inp"])) {
-            Ok(Invocation::CompareText(cmd)) => {
-                assert_eq!(cmd.input, PathBuf::from("SnapWave.inp"));
-                assert!(!cmd.verbose);
-            }
-            other => panic!("expected a compare-text invocation, got {other:?}"),
-        }
-        // Still needs the positional input path.
-        let err = parse(&args(&["--compare-text"])).expect_err("input path still required");
-        assert!(err.contains("missing input"), "error was: {err}");
-        assert!(help_text("snapwave").contains("--compare-text"));
-    }
-
-    #[test]
-    fn compare_mesh_flag_is_parsed() {
-        match parse(&args(&["--compare-mesh", "SnapWave.inp"])) {
-            Ok(Invocation::CompareMesh(cmd)) => {
-                assert_eq!(cmd.input, PathBuf::from("SnapWave.inp"));
-                assert!(!cmd.verbose);
-            }
-            other => panic!("expected a compare-mesh invocation, got {other:?}"),
-        }
-        // Still needs the positional input path.
-        let err = parse(&args(&["--compare-mesh"])).expect_err("input path still required");
-        assert!(err.contains("missing input"), "error was: {err}");
-        assert!(help_text("snapwave").contains("--compare-mesh"));
-    }
-
-    #[test]
-    fn compare_geometry_flag_is_parsed() {
-        match parse(&args(&["--compare-geometry", "SnapWave.inp"])) {
-            Ok(Invocation::CompareGeometry(cmd)) => {
-                assert_eq!(cmd.input, PathBuf::from("SnapWave.inp"));
-                assert!(!cmd.verbose);
-            }
-            other => panic!("expected a compare-geometry invocation, got {other:?}"),
-        }
-        // Still needs the positional input path.
-        let err = parse(&args(&["--compare-geometry"])).expect_err("input path still required");
-        assert!(err.contains("missing input"), "error was: {err}");
-        assert!(help_text("snapwave").contains("--compare-geometry"));
     }
 
     #[test]

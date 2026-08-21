@@ -7,57 +7,38 @@ plan; read it before any structural change.
 ## What this project is
 
 SnapWave is a fast, implicit, unstructured-grid short wave solver, originally
-Fortran (with bundled C: Triangle; Fortran: kdtree2). It is being rewritten in
-Rust using a **strangler fig** approach:
+Fortran (with bundled C: Triangle; Fortran: kdtree2). It has been rewritten
+in Rust using a **strangler fig** approach:
 
-- a Rust binary (Cargo-orchestrated) provides `main` and calls the unchanged
-  Fortran solver through one coarse C ABI facade (`src/snapwave_c_api.f90`);
-- subsystems move to Rust **outside-in**, one at a time, only after regression
-  tests pin their current behaviour;
-- the Fortran implementation stays available as the oracle until each migrated
-  Rust path passes regression.
+- subsystems moved to Rust **outside-in**, one at a time, only after
+  regression tests pinned their behaviour;
+- the Fortran implementation stayed available as the oracle until each
+  migrated Rust path passed regression.
 
-Current state: the Cargo-orchestrated wrapper/bootstrap is complete, and
-plan.md Phases 1 (test oracle and baselines), 2 (Rust CLI and run
-context), 3 (`SnapWave.inp` parsing in Rust, validated against the
-Fortran reader through the temporary `--compare-input` hook), 4 (config
-defaults, validation, and diagnostics), 5 (filesystem and output
-directory handling in Rust), 6 (auxiliary text input readers, validated
-against the Fortran readers through the temporary `--compare-text` hook),
-7 (NetCDF input and output: a hand-rolled classic-format writer/reader,
-a Rust `nc_read_net` port validated through the `--compare-mesh` hook,
-and Rust-owned map/history output written from a Fortran state capture
-stream) and 8 (Rust domain and mesh data structures: explicit Rust state
-handed to a coarse Fortran entry point as Rust-owned buffers through
-`snapwave_run_capture_state_c`, pinned by the `--legacy-mesh`
-route-parity tests) and 9 (geometry, interpolation and lookup utilities:
-Rust ports of the date/time utilities, the generic interpolation helpers,
-the surrounding-point/upwind-neighbour preprocessing and the
-boundary/observation interpolation weights, pinned against the Fortran
-oracle by the `--compare-geometry` hook; the sample-point `triintfast`/
-Triangle/`kdtree2` path stays Fortran by a documented decision) and
-10 (solver state boundary: Rust-owned time loop and output scheduling)
-and 11 (solver internals: Rust ports of all numerical solver routines —
-tridiagonal solve, Baldock breaking, heapsort, dispersion relation,
-celerities, numerical limiter, wind input, vegetation dissipation, and
-the full `compute_wave_field`/`solve_energy_balance2Dstat` implicit
-4-sweep solver — pinned against the Fortran oracle by the
-`--compare-solver` hook) are done. Phase 12 (retire Fortran from the
-Rust build) is the active frontier.
+Current state: the migration is complete. Phases 1–11 moved the CLI, run
+context, input parsing, config defaults/validation, filesystem handling,
+text readers, NetCDF IO, data structures, geometry/interpolation, time
+loop and solver internals to Rust. **Phase 12 is done**: the Cargo build
+no longer compiles or links any Fortran/C/NetCDF source — the production
+executable is 100% Rust (`src_rust/`, orchestrated by `src_rust/model.rs`).
+The legacy `make` build (`src/`, `utils_lgpl/`, `third_party_open/`) is
+retained unchanged as the numerical oracle (`flake.nix` `snapwave-legacy`,
+or `SNAPWAVE_ORACLE`), used only by the regression suite.
 
 ## Non-negotiable rules
 
-1. **Fortran is the numerical authority.** Do not "improve" scientific or
-   numerical behaviour while migrating it. A change either preserves outputs
-   (within defined tolerances) or intentionally alters physics — never both
+1. **The committed regression baselines are the numerical authority.** Do
+   not "improve" scientific or numerical behaviour while changing the Rust
+   solver. A change either preserves outputs (within the tolerances in
+   `tests/support/compare.rs`) or intentionally alters physics — never both
    in one step.
-2. **Keep the FFI boundary coarse.** All crossing goes through the facade in
-   `src/snapwave_c_api.f90`. Do not bind individual solver, interpolation or
-   NetCDF routines until the corresponding plan.md phase calls for it.
-3. **Keep both builds green.** The legacy `make` build and `cargo build` must
-   both keep working unless a phase explicitly retires one. When adding or
-   removing Fortran sources, update the compile-order lists in **both** the
-   `Makefile` and `build.rs` (module order matters).
+2. **The Fortran oracle is the reference.** Any change to `src_rust/model.rs`
+   or `src_rust/solver.rs` must be validated against the `make`-built oracle
+   through `cargo test` before it is trusted. (The FFI facade is gone; the
+   oracle runs as a separate binary, not inside the Rust process.)
+3. **Keep both builds green.** The legacy `make` build (Fortran oracle) and
+   `cargo build` (pure Rust) must both keep working. The Rust build needs no
+   Fortran/C/NetCDF toolchain.
 4. **`src/snapwave.f90` is deliberately not compiled into the Cargo binary**
    (Rust provides `main`). When changing the model lifecycle, keep
    `src/snapwave.f90` and `src/snapwave_c_api.f90` in sync.
@@ -72,14 +53,13 @@ Rust build) is the active frontier.
 
 | Path | Contents |
 | --- | --- |
-| `src/` | Fortran solver sources (compile order matters) |
-| `src_rust/` | Rust wrapper sources (`[[bin]] path` in `Cargo.toml`) |
-| `build.rs` | Cargo orchestrator: Fortran + Triangle compilation, NetCDF/OMP/runtime linking |
-| `Makefile` | Legacy stand-alone Fortran build → `SnapWave/lnx64/bin/snapwave` |
-| `Cargo.toml` | Crate manifest; Rust binary is also named `snapwave` |
-| `flake.nix` | Nix dev shell, package and smoke-test check |
-| `third_party_open/` | Bundled Triangle (C) and kdtree2 (Fortran) |
-| `utils_lgpl/` | Deltares common utils + kdtree wrapper |
+| `src/` | Fortran solver sources (compile order matters) — retained for the legacy `make` oracle only |
+| `src_rust/` | 100%-Rust production binary sources (`[[bin]] path` in `Cargo.toml`) |
+| `Makefile` | Legacy stand-alone Fortran build → `SnapWave/lnx64/bin/snapwave` (the numerical oracle) |
+| `Cargo.toml` | Crate manifest; pure-Rust binary also named `snapwave` (no build script) |
+| `flake.nix` | Nix dev shell, pure-Rust package, legacy-oracle package and smoke-test check |
+| `third_party_open/` | Bundled Triangle (C) and kdtree2 (Fortran) — used only by the legacy `make` build |
+| `utils_lgpl/` | Deltares common utils + kdtree wrapper — used only by the legacy `make` build |
 | `tests/` | Cargo integration tests: `mwe.rs` smoke test; Phase-1 harness (`regression.rs`, `support/`, see `tests/README.md`); Phase-2 CLI tests (`cli.rs`) |
 | `testcases/` | Validation cases; `31_linear_shoaling_refraction/run/coarse` is the MWE regression target |
 | `plan.md` | Migration plan (phases, constraints, risks) |
@@ -88,28 +68,27 @@ Rust build) is the active frontier.
 
 ## Build, run, test
 
-Toolchain prerequisites: `gfortran`, `cc`, `nf-config` (netCDF-Fortran);
-`ncdump` (netCDF tools) is optional but used by schema checks. A Nix dev
-shell provides everything: `nix develop` (or direnv).
+Toolchain prerequisites for the production build: a Rust toolchain
+(`rustc`, `cargo`) only — **no** Fortran/C/NetCDF compiler or library is
+needed. Building the legacy oracle additionally needs `gfortran`, `cc`,
+`nf-config` (netCDF-Fortran); `ncdump` (netCDF tools) is optional but used
+by schema checks. A Nix dev shell provides everything: `nix develop` (or
+direnv).
 
 ```sh
-cargo build                        # Rust + all Fortran/C objects + link
-DEBUG=1 cargo build                # mirrors `make DEBUG=1` (g, O0, checks)
+cargo build                        # pure Rust; no Fortran/C/NetCDF
 cargo test                         # smoke, regression and CLI tests
-cargo run -- path/to/SnapWave.inp  # run the model through the wrapper
-cargo run -- --help                # wrapper CLI usage (Phase 2)
+cargo run -- path/to/SnapWave.inp  # run the model
+cargo run -- --help                # CLI usage (Phase 2)
 
-make                # legacy stand-alone Fortran build (must keep working)
+make                # legacy stand-alone Fortran build (the numerical oracle)
 make DEBUG=1
 make clean
 
-nix build                    # default package: Cargo-built Rust wrapper
+nix build                    # default package: pure-Rust binary
 nix build .#snapwave-legacy  # legacy Makefile build (the Fortran oracle)
-nix flake check              # Nix build + smoke test of the Rust wrapper
+nix flake check              # Nix build + smoke test of the Rust binary
 ```
-
-Environment variables respected by `build.rs`: `FC`, `CC`, `NF_CONFIG`,
-`DEBUG`. Defaults mirror the `Makefile` (`gfortran`, `cc`, `nf-config`).
 
 ## Regression testing rules
 
@@ -118,74 +97,44 @@ Environment variables respected by `build.rs`: `FC`, `CC`, `NF_CONFIG`,
 - Testcases are authored on Windows: **normalize `\` → `/` only on temp
   copies** (`cargo test` and the flake check already do this). Never commit
   modified testcase inputs.
-- The wrapper `chdir`s to the input file's parent before calling the
-   facade, because the Fortran readers resolve sibling input and output
-   file names relative to the CWD (the configuration itself has crossed
-   as resolved text since Phase 4). Output *directories* are Rust-owned
-   since Phase 5 (`src_rust/paths.rs` creates/validates them before the
-   core runs), but the file *names* still resolve CWD-relative in
-   Fortran. Phases 6-8 moved most readers (mesh, polylines, obs points,
-   boundary series now cross as Rust-owned state on the default route),
-   but the wind and value-or-file sample readers (`fw`/`fwig`, vegetation)
-   still open CWD-relative files — preserve the chdir contract until
-   those move in Phase 11. The chdir is isolated in
-   `RunContext::enter_run_dir()` (`src_rust/run_context.rs`) so that
-   phase can remove it cleanly.
+- Since Phase 12 all file references resolve through `src_rust/paths.rs`
+  against the input file's directory; there is no `chdir` and no FFI name
+  conversion any more.
 - Existing checks are structural: exit status, output file presence, NetCDF
-  headers via `ncdump -h`. **Any change touching output or migrated
-  subsystems must extend `tests/mwe.rs`** (or add tests) to cover it.
-  Exact floating-point reproducibility is not expected — define tolerances
-  when adding numeric checks.
-- Phase-1 numeric regression lives in `tests/regression.rs`: wrapper output
-  is compared against committed testcase reference NetCDF files and, when the
-  legacy `make` build exists (or `SNAPWAVE_ORACLE` is set), against the live
-  Fortran oracle. Per-variable tolerances live in
+  headers via `ncdump -h`. Exact floating-point reproducibility is not
+  expected — tolerances live in `tests/support/compare.rs`.
+- Phase-1 numeric regression lives in `tests/regression.rs`: the pure-Rust
+  binary's output is compared against committed testcase reference NetCDF
+  files and, when the legacy `make` build exists (or `SNAPWAVE_ORACLE` is
+  set), against the live Fortran oracle. Per-variable tolerances live in
   `tests/support/compare.rs`; see `tests/README.md` before adding cases.
-- Each newly migrated subsystem keeps the Fortran path callable as the
-  oracle and is validated against it before the Fortran side is retired.
 
 ## Known pitfalls
 
-- **Fortran module global state**: one model run per process. Repeated calls
-  into the facade from the same process are unsafe until reset/finalize
-  logic exists. Don't "fix" this casually.
-- **Fortran `stop` kills the whole Rust process.** When a `stop` becomes
-  reachable through the facade, prefer converting it to a status return —
-  but only on paths the facade actually hits.
-- **Array ordering**: Fortran is column-major, Rust is row-major. Avoid
-  passing large multidimensional arrays across FFI (a plan.md constraint).
-- **Static link order matters**: the Fortran archive must precede the
-  Triangle archive (`build.rs` handles this; don't reorder).
-- **`nf-config --flibs` tokens** need careful translation in `build.rs`
-  (`-L`/`-l`/absolute paths/`-Wl,`).
-- **OpenMP + libgfortran linking** through rustc is toolchain-specific;
-  `build.rs` queries the compiler for paths (works under Nix too).
+- **The Fortran oracle is a separate process.** It runs the legacy `make`
+  binary with its CWD in the run directory and reads `SnapWave.inp` itself.
+  The Rust binary and the oracle never share a process.
+- **Array ordering**: Fortran is column-major, Rust is row-major. The Rust
+  solver keeps column-major flat buffers (`ee`, `w`, `ds`, `prev`, `ctheta`)
+  in exactly the Fortran memory order; see the module docs in `src_rust/`.
 - Build artefacts (`SnapWave/lnx64/`, `target/`) are gitignored — never
   commit them or generated NetCDF outputs.
 
 ## Code style
 
-### Rust (`src_rust/`, `tests/`, `build.rs`)
+### Rust (`src_rust/`, `tests/`)
 
 - Edition 2021; keep dependencies minimal (`anyhow`; add `clap` only when
   argument parsing genuinely grows).
 - Document the **why**, not the what; reference the relevant plan.md phase
   in comments where the design is non-obvious.
 - Use `anyhow` with `.with_context(...)` for user-facing failures; the
-  wrapper exits with status 2 on its own errors and passes through non-zero
-  Fortran status codes unchanged.
-- FFI signatures live in `src_rust/main.rs` and must match
-  `src/snapwave_c_api.f90` exactly (`bind(C)`; explicit length, no reliance
-  on NUL termination).
+  wrapper exits with status 2 on its own errors.
 
 ### Fortran (`src/`)
 
-- Match the existing style of the file you are editing.
-- New boundary/facade code goes in `src/snapwave_c_api.f90`; keep solver
-  internals untouched except where a plan.md phase explicitly opens them.
-- Prefer status returns over `stop`/`abort` on newly exposed paths.
-- Any new Fortran source must be added to the `Makefile` and `build.rs`
-  lists in correct dependency order, and must not break `make`.
+- Retained as the numerical oracle; keep it unchanged except for genuine
+  build-integration fixes, and keep `make` green.
 
 ### Definition of done for any change
 

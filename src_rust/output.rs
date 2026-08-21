@@ -32,6 +32,13 @@ use crate::netcdf::{
 /// `FILL_VALUE` of `snapwave_data.f90` (`-999999.0`, real*4).
 const FILL_VALUE: f32 = -999_999.0;
 
+/// The `Build-Revision-Date-Netcdf-library` attribute value. The Fortran
+/// writer embeds `nf90_inq_libvers()`; the pure-Rust writer has no NetCDF
+/// library, so it records the hand-rolled classic-format writer instead.
+/// The regression harness excludes this attribute from schema comparison
+/// (it legitimately differs between machines).
+pub const LIBVERS: &str = "Rust classic-format writer (no NetCDF library)";
+
 // ----------------------------------------------------------------------
 // Shared helpers
 // ----------------------------------------------------------------------

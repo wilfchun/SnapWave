@@ -97,7 +97,7 @@ const LIST_SEPARATORS: [char; 5] = [' ', '\t', ',', '/', '\r'];
 
 /// Time and run-control settings (globals `trefstr`…`tstop`, `timestep`,
 /// `dt`, `niter`, `crit`, `restart`).
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct TimeControl {
     /// Reference date string `yyyymmdd hhmmss` (global `trefstr`).
     pub tref: String,
@@ -123,7 +123,7 @@ pub struct TimeControl {
 
 /// Grid / domain description (globals `nmax`…`sector`, `gridfile`,
 /// `depfile`, `mskfile`, `indfile`, `upwfile`).
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct GridConfig {
     /// Number of cells in the first grid direction **plus two dummy rows**
     /// (as left behind in the global by `read_snapwave_input`).
@@ -157,7 +157,7 @@ pub struct GridConfig {
 
 /// Boundary forcing file names (globals `jonswapfile`…`bzsfile`, `obsfile`,
 /// `tol`).
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct BoundaryConfig {
     /// Single-point JONSWAP spectrum file (optional).
     pub jonswapfile: String,
@@ -181,7 +181,7 @@ pub struct BoundaryConfig {
 /// Wind input (globals `u10str`, `u10dirstr`, `windlistfile`, `mwind`,
 /// `wind`). `u10`/`u10dir` stay strings: they hold either a uniform value
 /// or a file name, disambiguated later by the Fortran readers.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct WindConfig {
     /// Wind speed: uniform value or file name (global `u10str`).
     pub u10: String,
@@ -197,7 +197,7 @@ pub struct WindConfig {
 }
 
 /// Output selection (globals `map_filename`…`ja_save_each_iter`).
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct OutputConfig {
     pub map_file: String,
     pub his_file: String,
@@ -226,14 +226,14 @@ pub struct OutputConfig {
 }
 
 /// Diagnostics switches (global `writetestfiles`).
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct Diagnostics {
     /// `writetestfiles` keyword, non-zero → true.
     pub writetestfiles: bool,
 }
 
 /// Vegetation settings (globals `ja_vegetation`, `vegmapfile`).
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct VegetationConfig {
     pub ja_vegetation: i32,
     pub vegmapfile: String,
@@ -241,7 +241,7 @@ pub struct VegetationConfig {
 
 /// Solver physics knobs (globals `gamma`…`fw_igstr`, `Tpini`, `zsini`,
 /// `sigmin`, `sigmax`, `jadcgdx`, `c_dispT`, `ig`, `upwindref`).
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct PhysicsConfig {
     pub gamma: f32,
     pub alpha: f32,
@@ -271,7 +271,7 @@ pub struct PhysicsConfig {
 /// (plan.md Phase 3, step 3). Values are the *model-facing* globals after
 /// `read_snapwave_input` post-processing (see the quirks in the module
 /// docs).
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct SnapWaveInput {
     pub time: TimeControl,
     pub grid: GridConfig,
