@@ -48,6 +48,12 @@ pub enum Invocation {
     /// `nc_read_net` reader through the temporary Phase 7 hook, and exit
     /// without running the model (plan.md Phase 7, step 2).
     CompareMesh(RunCommand),
+    /// Compute the derived geometry (surrounding points, upwind neighbours,
+    /// observation interpolation weights, boundary support-point mapping) in
+    /// Rust, compare against the unchanged Fortran routines through the
+    /// temporary Phase 9 hook, and exit without running the model (plan.md
+    /// Phase 9).
+    CompareGeometry(RunCommand),
 }
 
 /// A requested model run, still unvalidated: input validation happens when
@@ -58,6 +64,17 @@ pub struct RunCommand {
     pub input: PathBuf,
     /// Logging preference: print the run context before starting the model.
     pub verbose: bool,
+    /// Test hook (plan.md Phase 8 parity check, `tests/domain_state.rs`):
+    /// let the Fortran core read the mesh/text inputs itself instead of
+    /// consuming the Rust-owned state. Not advertised in `--help` — it
+    /// exists to pin the state handoff against the unchanged Fortran
+    /// readers without requiring the `make`-built oracle.
+    pub legacy_mesh: bool,
+    /// Test hook (plan.md Phase 10 parity check): force the old
+    /// Fortran-owned time loop (`snapwave_run_capture_c` /
+    /// `snapwave_run_capture_state_c`) instead of the Rust-owned loop.
+    /// Not advertised in `--help`.
+    pub fortran_time_loop: bool,
 }
 
 /// Parse `args` (including `argv[0]`) into an [`Invocation`].
@@ -70,9 +87,12 @@ pub fn parse(args: &[OsString]) -> Result<Invocation, String> {
     let prog = program_name(args.first());
     let mut input: Option<OsString> = None;
     let mut verbose = false;
+    let mut legacy_mesh = false;
+    let mut fortran_time_loop = false;
     let mut compare_input = false;
     let mut compare_text = false;
     let mut compare_mesh = false;
+    let mut compare_geometry = false;
     let mut only_positional = false;
 
     for arg in args.iter().skip(1) {
@@ -90,9 +110,12 @@ pub fn parse(args: &[OsString]) -> Result<Invocation, String> {
                 return Ok(Invocation::Version(version_text()));
             }
             (true, Some("-v")) | (true, Some("--verbose")) => verbose = true,
+            (true, Some("--legacy-mesh")) => legacy_mesh = true,
+            (true, Some("--fortran-time-loop")) => fortran_time_loop = true,
             (true, Some("--compare-input")) => compare_input = true,
             (true, Some("--compare-text")) => compare_text = true,
             (true, Some("--compare-mesh")) => compare_mesh = true,
+            (true, Some("--compare-geometry")) => compare_geometry = true,
             (true, Some(other)) => return Err(format!("unknown option: {other}")),
             (true, None) => {
                 return Err(format!("unknown option: {}", arg.to_string_lossy()));
@@ -105,11 +128,17 @@ pub fn parse(args: &[OsString]) -> Result<Invocation, String> {
         }
     }
 
-    let command = |input: OsString| RunCommand { input: PathBuf::from(input), verbose };
+    let command = |input: OsString| RunCommand {
+        input: PathBuf::from(input),
+        verbose,
+        legacy_mesh,
+        fortran_time_loop,
+    };
     match input {
         Some(input) if compare_input => Ok(Invocation::CompareInput(command(input))),
         Some(input) if compare_text => Ok(Invocation::CompareText(command(input))),
         Some(input) if compare_mesh => Ok(Invocation::CompareMesh(command(input))),
+        Some(input) if compare_geometry => Ok(Invocation::CompareGeometry(command(input))),
         Some(input) => Ok(Invocation::Run(command(input))),
         None => Err(format!("missing input path (expected one {INPUT_FILE_HINT} file)")),
     }
@@ -157,6 +186,12 @@ Options:
   --compare-mesh   Read the mesh NetCDF (gridfile) in Rust and compare
                    against the unchanged Fortran nc_read_net reader, then
                    exit without running the model (plan.md Phase 7)
+  --compare-geometry
+                   Compute the derived geometry (surrounding points, upwind
+                   neighbours, observation weights, boundary support-point
+                   mapping) in Rust and compare against the Fortran
+                   routines, then exit without running the model (plan.md
+                   Phase 9)
   -h, --help     Print this help and exit
   -V, --version  Print version information and exit
 
@@ -287,6 +322,21 @@ mod tests {
         let err = parse(&args(&["--compare-mesh"])).expect_err("input path still required");
         assert!(err.contains("missing input"), "error was: {err}");
         assert!(help_text("snapwave").contains("--compare-mesh"));
+    }
+
+    #[test]
+    fn compare_geometry_flag_is_parsed() {
+        match parse(&args(&["--compare-geometry", "SnapWave.inp"])) {
+            Ok(Invocation::CompareGeometry(cmd)) => {
+                assert_eq!(cmd.input, PathBuf::from("SnapWave.inp"));
+                assert!(!cmd.verbose);
+            }
+            other => panic!("expected a compare-geometry invocation, got {other:?}"),
+        }
+        // Still needs the positional input path.
+        let err = parse(&args(&["--compare-geometry"])).expect_err("input path still required");
+        assert!(err.contains("missing input"), "error was: {err}");
+        assert!(help_text("snapwave").contains("--compare-geometry"));
     }
 
     #[test]

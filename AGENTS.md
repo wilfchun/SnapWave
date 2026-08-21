@@ -23,11 +23,21 @@ context), 3 (`SnapWave.inp` parsing in Rust, validated against the
 Fortran reader through the temporary `--compare-input` hook), 4 (config
 defaults, validation, and diagnostics), 5 (filesystem and output
 directory handling in Rust), 6 (auxiliary text input readers, validated
-against the Fortran readers through the temporary `--compare-text` hook)
-and 7 (NetCDF input and output: a hand-rolled classic-format writer/reader,
-a Rust `nc_read_net` port validated through the `--compare-mesh` hook, and
-Rust-owned map/history output written from a Fortran state capture stream)
-are done. Phase 8 (Rust domain and mesh data structures) is the active
+against the Fortran readers through the temporary `--compare-text` hook),
+7 (NetCDF input and output: a hand-rolled classic-format writer/reader,
+a Rust `nc_read_net` port validated through the `--compare-mesh` hook,
+and Rust-owned map/history output written from a Fortran state capture
+stream) and 8 (Rust domain and mesh data structures: explicit Rust state
+handed to a coarse Fortran entry point as Rust-owned buffers through
+`snapwave_run_capture_state_c`, pinned by the `--legacy-mesh`
+route-parity tests) and 9 (geometry, interpolation and lookup utilities:
+Rust ports of the date/time utilities, the generic interpolation helpers,
+the surrounding-point/upwind-neighbour preprocessing and the
+boundary/observation interpolation weights, pinned against the Fortran
+oracle by the `--compare-geometry` hook; the sample-point `triintfast`/
+Triangle/`kdtree2` path stays Fortran by a documented decision) are done.
+Phase 10 (solver state boundary: Rust-owned time loop and output
+scheduling) is done. Phase 11 (solver internals in Rust) is the active
 frontier.
 
 ## Non-negotiable rules
@@ -47,10 +57,8 @@ frontier.
    (Rust provides `main`). When changing the model lifecycle, keep
    `src/snapwave.f90` and `src/snapwave_c_api.f90` in sync.
 5. **Follow the plan.md phase order** when picking what to move next
-   (currently: CLI args → `SnapWave.inp` parsing → config
-   defaults/diagnostics → output directory handling → text input readers →
-   NetCDF output → mesh/domain data structures → solver internals). Do not
-   jump ahead to the solver.
+   (currently: Phases 1–10 are done; Phase 11 — solver internals — is
+   next). Do not jump ahead to the solver.
 6. **Third-party code is read-only in practice.** Do not modify
    `third_party_open/` or `utils_lgpl/` except for build integration fixes.
    Keep licensing (LGPL, see `LICENSE`) intact.
@@ -106,15 +114,18 @@ Environment variables respected by `build.rs`: `FC`, `CC`, `NF_CONFIG`,
   copies** (`cargo test` and the flake check already do this). Never commit
   modified testcase inputs.
 - The wrapper `chdir`s to the input file's parent before calling the
-  facade, because the Fortran readers resolve sibling input and output
-  file names relative to the CWD (the configuration itself has crossed
-  as resolved text since Phase 4). Output *directories* are Rust-owned
-  since Phase 5 (`src_rust/paths.rs` creates/validates them before the
-  core runs), but the file *names* still resolve CWD-relative in
-  Fortran. Preserve the chdir contract until the remaining readers and
-  the NetCDF IO move to Rust (Phases 6-7). The chdir is isolated in
-  `RunContext::enter_run_dir()` (`src_rust/run_context.rs`) so those
-  phases can remove it cleanly.
+   facade, because the Fortran readers resolve sibling input and output
+   file names relative to the CWD (the configuration itself has crossed
+   as resolved text since Phase 4). Output *directories* are Rust-owned
+   since Phase 5 (`src_rust/paths.rs` creates/validates them before the
+   core runs), but the file *names* still resolve CWD-relative in
+   Fortran. Phases 6-8 moved most readers (mesh, polylines, obs points,
+   boundary series now cross as Rust-owned state on the default route),
+   but the wind and value-or-file sample readers (`fw`/`fwig`, vegetation)
+   still open CWD-relative files — preserve the chdir contract until
+   those move in Phase 11. The chdir is isolated in
+   `RunContext::enter_run_dir()` (`src_rust/run_context.rs`) so that
+   phase can remove it cleanly.
 - Existing checks are structural: exit status, output file presence, NetCDF
   headers via `ncdump -h`. **Any change touching output or migrated
   subsystems must extend `tests/mwe.rs`** (or add tests) to cover it.

@@ -440,6 +440,55 @@ Acceptance:
 - The Fortran path can still run as oracle.
 - Array shape and indexing conversions are covered by focused tests.
 
+Status: implemented (2026-08-20). Step 1: `DomainState` in
+`src_rust/state.rs` composes the already-Rust-owned parses — config
+(`input`), mesh (`mesh`), boundary forcing, wind forcing, observation
+points and polylines (`text_input`) — plus a `RuntimeState` holding the
+scheduling scalars `run_time_loop` initialises (tstart/tstop/timestep,
+intervals, next-output times, counters, output tolerance; the documented
+Phase 10 seam where output scheduling becomes Rust-owned). Steps 2-3:
+`src_rust/ffi_layout.rs` is the localized conversion layer — one-based
+index helpers and a `ColMajor` layout type whose tests pin the Fortran
+memory formula `(i1-1) + d1*(i2-1) + ...` and the two facts that make
+the SnapWave handoffs copy-free: the node-major `face_nodes` buffer *is*
+the column-major flattening of `face_nodes(4, no_faces)`, and the
+time-major series layout *is* the column-major flattening of
+`hs_bwv(nwbnd, ntwbnd)`. Steps 4-5: the `snapwave_data` globals for the
+mesh, the enclosure/Neumann polylines, the observation-point coordinates
+and the boundary series switched from `allocatable` to `pointer`
+(`nameobs` stays allocatable — character arrays do not associate
+portably and are copied from 32-byte blank-padded records); the new
+coarse entry point `snapwave_run_capture_state_c` receives one
+`#[repr(C)]` struct (`SnapWaveStateC` ↔ the `bind(C)` `snapwave_state_t`
+mirror; Fortran-compatible widths: `real*8`/`real*4`/`integer*1`/
+`integer`) and associates the globals with the Rust-owned buffers via
+`c_f_pointer` — allocation ownership of those non-solver arrays is
+Rust's, and Fortran no longer reads those files on this route. Reading
+was split from derived computation so nothing else moved:
+`initialize_snapwave_domain` gained an optional `mesh_from_rust` flag
+(skipping the readers and the post-processing the Rust reader already
+applies — the `zb = -posdwn*zb` flip must not run twice), and
+`init_obs_points_from_state` / `init_boundary_from_state` perform the
+derived tails of `read_obs_points` / `read_boundary_data` (weights via
+`make_map_fm` / `find_boundary_indices` stay Fortran — Phase 9).
+Wind and the `fw`/`fwig` value-or-file inputs remain Fortran-read: their
+file-backed branch needs `triintfast` mesh interpolation (Phase 9); the
+uniform wind data already crosses as resolved config text. The wrapper
+dispatches exactly like `initialize_snapwave_domain` did
+(`rust_owns_gridfile` mirrors the two-characters-after-the-first-dot
+extension check, quirks included): NetCDF grids take the state route,
+other formats keep `snapwave_run_capture_c`, as does the hidden
+`--legacy-mesh` parity hook. Acceptance: the run path hands migrated
+subsystem data from Rust state (no Fortran re-read of mesh, polylines,
+obs or boundary files); the oracle is intact — `make` and the unchanged
+`snapwave_run_c`/reader route still work, all `--compare-*` hooks are
+untouched, and the regression suite passes with the live-oracle
+comparison active (outputs identical); conversions are covered by
+focused unit tests in `ffi_layout.rs`/`state.rs` plus the route-parity
+tests `tests/domain_state.rs` (case 31 timeseries mode, case 32
+single-point JONSWAP mode: state route vs `--legacy-mesh`, strict
+comparison).
+
 ## Phase 9: Geometry, Interpolation, And Lookup Utilities
 
 Goal: migrate supporting numerical utilities before the wave solver itself.
@@ -470,6 +519,49 @@ Acceptance:
   match the Fortran oracle on representative meshes.
 - Any third-party replacement is justified by tests and licensing review.
 
+Status: implemented (2026-08-20). Step 1: the date/time utilities are split
+into `src_rust/date.rs` (`julian_date`, `parse_date15`, `seconds_between` =
+`time_difference`, `date_to_iso8601`), and `src_rust/input.rs` now delegates
+to them instead of carrying private copies. `convert_fewsdate` is deliberately
+not ported: it has no callers and reads an uninitialised local `trefstr`, so
+there is no oracle behaviour to preserve (documented in `date.rs`). Step 2:
+`src_rust/interp.rs` ports the small deterministic helpers with hand-checked
+fixture tests — `binary_search`, `linear_interp`, `linear_interp_2d`, `hunt`,
+`indexx`/`sort`, `ipon`, `bilin5`, `triangle_intp`, the trapezoidal family
+(`trapezoidal`, `trapezoidal_cyclic`, `interp_using_trapez_rule`,
+`interp_in_cyclic_function`) and the curvilinear-grid mapping routines
+(`make_map`, `mkmap_step`, `grmap`, `grmap2`, `grmap_sg`) — plus
+`make_map_fm`. Every `real*4`/`real*8` width and single-precision literal
+(the Fortran default real kind) is preserved so the ports match bit-for-bit.
+Step 3: `src_rust/geometry.rs` ports the runtime geometry — `fm_surrounding_points`
+(surrounding-point ring + `real*4` plane fit via `plane_fit`/`solve_linear_system`),
+`find_upwind_neighbours`/`intersect_angle`, `neuboundaries` and
+`find_boundary_indices` — and the new facade hook `snapwave_geometry_dump_c`
+(`src/snapwave_c_api.f90`) runs the unchanged Fortran routines
+(`initialize_snapwave_domain` + `read_obs_points` + `read_boundary_data`) and
+dumps the resulting globals (`kp`, `dhdx`/`dhdy`, `w360`/`prev360`/`ds360`,
+`msk`, `neumannconnected`, `nmindbnd`/`neubnd`, `wobs`/`irefobs`/`nrefobs`,
+`ind1/ind2/fac_bwv_cst`) in the canonical sectioned format. The wrapper's
+`--compare-geometry` mode (`src_rust/geometry_compare.rs`) computes the same
+geometry in Rust and compares (integers exact; reals bit-exact first, then the
+1e-6/1e-9 relative tolerances already used by the Phase 3/4/6 comparisons,
+because the geometry involves `hypot`/`tan`/`atan2` libm results that may
+drift one ulp between runtimes). `tests/geometry.rs` runs it on the checked-in
+cases (31 coarse triangles, 32 curvilinear quads, 33 circle reef, 45
+haringvliet), pinning acceptance "mesh preprocessing, interpolation weights
+and boundary/observation mappings match the Fortran oracle on representative
+meshes". Step 4 (decision): the sample-point path `triintfast`/`findtri_kdtree`/
+`dlaun` — backed by the bundled C Triangle and the Fortran `kdtree2` wrapper —
+stays Fortran, because it is only reachable through the value-or-file
+`fw`/`fwig`/`u10`/`u10dir` inputs when those name a file, and no checked-in
+testcase exercises that branch; replacing read-only third-party code with
+Rust-native Delaunay/k-d-tree crates would add runtime dependencies with no
+oracle testcase to justify the licensing/parity review (recorded in
+`src_rust/geometry.rs`). Step 5 is deliberately not taken: parity is proven
+through the hook, but the Fortran routines remain the runtime authority and
+stay in the build until a later phase wires the Rust results into the state
+handoff.
+
 ## Phase 10: Solver State Boundary
 
 Goal: prepare for solver migration without rewriting solver physics yet.
@@ -490,6 +582,80 @@ Acceptance:
 - Rust owns orchestration of the time loop and output scheduling.
 - Fortran solver can still be called as one coarse numerical kernel.
 - State snapshots make solver rewrites reviewable in small pieces.
+
+Status: implemented (2026-08-21). Step 1: `ModelState` in `src_rust/state.rs`
+owns the time-loop scheduling state — current time `t`, iteration counter
+`it`, next-output times, output counters, and the `output_tol` tolerance —
+with scheduling predicates (`should_output_map`, `should_output_his`) and
+advancement methods (`record_map_output`, `record_his_output`,
+`advance_time`) that mirror the Fortran `run_time_loop` logic exactly,
+including the `do while` advancement that handles timesteps larger than the
+output interval. Unit tests in `state.rs` pin the initialisation, the
+`output_tol` floor, the predicates (including the `ja_save_each_iter`,
+empty-filename and `nobs==0` suppression cases), the interval-advancement
+`do while` loop, and the `t <= tstop` termination condition.
+
+Step 2: six new coarse Fortran entry points in `src/snapwave_c_api.f90`:
+`snapwave_init_capture_c` (Rust-state route: config load, state association,
+domain/boundary/wind init, capture stream open, static output write — stops
+before the time loop), `snapwave_init_legacy_capture_c` (legacy route: same
+but reads files instead of consuming Rust state), `snapwave_timestep_c(t, it)`
+(one solver step: `update_boundary_conditions(t)` + `compute_wave_field(t)`),
+`snapwave_capture_map_c(t, ntmapout)` (capture map output via
+`ncoutput_update_map`), `snapwave_capture_his_c(t, nthisout)` (capture
+history output via `update_obs_points` + `ncoutput_update_his`), and
+`snapwave_finalize_capture_c` (close capture stream + reset capture mode).
+The existing `snapwave_run_capture_c` / `snapwave_run_capture_state_c` stay
+available for the `--fortran-time-loop` parity hook and the comparison hooks;
+they are unchanged. The shared init tail (`ncoutput_capture_begin` +
+`ncoutput_init`) is factored into `run_init_tail`.
+
+Step 3: route-parity tests in `tests/domain_state.rs`
+(`rust_time_loop_matches_fortran_time_loop_31_coarse`,
+`rust_time_loop_matches_fortran_time_loop_32_curvi_singlepoint`) run the
+MWE (boundary timeseries, enclosure+Neumann, obs points) and the curvilinear
+single-point-JONSWAP case through both the Rust-owned time loop (default
+Phase 10 path) and the Fortran-owned time loop (`--fortran-time-loop` hidden
+flag, which forces the old `snapwave_run_capture_state_c` path), then compare
+the map and history NetCDF outputs with strict Phase-1 tolerances. Both
+comparisons are bit-identical — the Rust scheduling logic reproduces the
+Fortran loop's output schedule exactly.
+
+Step 4: the `execute()` function in `src_rust/main.rs` now drives the time
+loop from Rust. After initialisation (Phase 10 init entry points), a
+`while model.is_running()` loop calls `snapwave_timestep_c` for each
+iteration, checks the Rust-owned scheduling predicates, and calls
+`snapwave_capture_{map,his}_c` when output is due. On any Fortran error
+the capture stream is finalised (closed) before bailing out. The
+`--fortran-time-loop` flag provides an escape hatch that uses the old
+Fortran-owned loop for parity comparison. Output scheduling is fully
+Rust-owned: Fortran no longer decides when to write output on the default
+route.
+
+Step 5: numerical invariants documented in `ModelState`'s module docs and
+in the Fortran entry-point comments:
+- Both output schedules start at `tstart` (first iteration outputs at t=0).
+- Output fires when `t >= next_*_output - output_tol` where
+  `output_tol = max(1d-6, |timestep|*1d-6)`.
+- After output, `next_*_output` advances by the interval in a `do while`
+  loop (handles timestep > interval).
+- History output additionally requires `nobs > 0` and a non-empty
+  `his_filename`.
+- Map output is suppressed when `ja_save_each_iter != 0`.
+- Time advances by `timestep` after output checks (not before).
+- The loop runs while `t <= tstop` (the last iteration is at the largest
+  `t` not exceeding `tstop`).
+- The iteration counter `it` is 1-based and incremented at the top of each
+  iteration, before the solver step.
+- The output counters (`map_output_count`, `his_output_count`) are 1-based
+  and passed to `ncoutput_update_{map,his}` as the NetCDF record index.
+
+Acceptance verified: `cargo test` passes all 148 tests (including the 2 new
+Phase 10 time-loop parity tests and the 2 existing Phase 8 route-parity
+tests); `cargo build` succeeds; the legacy `make` build is unaffected (the
+new entry points are additive and the existing facades are unchanged). The
+regression suite confirms the Phase 10 output matches both the committed
+baselines and the live Fortran oracle.
 
 ## Phase 11: Solver Internals In Rust
 

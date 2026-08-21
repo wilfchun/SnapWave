@@ -75,6 +75,13 @@ use std::path::Path;
 
 use anyhow::{bail, Context, Result};
 
+// plan.md Phase 9: the date/time utilities now live in `crate::date`
+// (split from the file-reading code, step 1); the input parser keeps using
+// the same `snapwave_date` behaviour through this re-export. `julian_date`
+// and `parse_date15` are only exercised by the unit tests below, so they
+// are imported inside `mod tests` rather than here.
+use crate::date::seconds_between;
+
 /// Line buffer width of the Fortran reader (`character(len=256)`).
 const FORTRAN_LINE_LEN: usize = 256;
 
@@ -793,75 +800,10 @@ fn truncate_chars(s: &str, width: usize) -> String {
     s[..end].to_string()
 }
 
-// ----------------------------------------------------------------------
-// Date handling mirroring snapwave_date.f90
-// ----------------------------------------------------------------------
-
-/// Calendar date and time fields (yyyy, mm, dd, hh, mn, ss).
-type DateFields = (i32, i32, i32, i32, i32, i32);
-
-/// Parse the fixed-position date read by `snapwave_date` with the format
-/// `'(I4,2I2,1X,3I2)'` from a `character*15` value: `yyyymmdd hhmmss`.
-/// The character at position 9 is skipped, blanks inside the numeric
-/// fields are ignored (Fortran BLANK='NULL' default), blank fields read as
-/// zero, and any other non-digit character is an error (a Fortran
-/// formatted-read runtime error).
-fn parse_date15(s: &str) -> Result<DateFields> {
-    let padded = format!("{s:<width$}", width = WIDTH_DATE);
-    let b = padded.as_bytes();
-    let field = |range: std::ops::Range<usize>| -> Result<i32> {
-        let mut digits = String::new();
-        for &c in &b[range] {
-            match c {
-                b' ' => continue,
-                b'0'..=b'9' => digits.push(c as char),
-                _ => bail!("invalid character '{}' in date '{s}' (expected yyyymmdd hhmmss)", c as char),
-            }
-        }
-        if digits.is_empty() {
-            Ok(0)
-        } else {
-            Ok(digits.parse::<i32>()?)
-        }
-    };
-    Ok((
-        field(0..4)?,   // yyyy
-        field(4..6)?,   // mm
-        field(6..8)?,   // dd
-        field(9..11)?,  // hh (position 8 is the skipped separator)
-        field(11..13)?, // mn
-        field(13..15)?, // ss
-    ))
-}
-
-/// Fliegel & Van Flandern Julian day number, identical to `julian_date`
-/// in `src/snapwave_date.f90`. Both Fortran and Rust integer division
-/// truncate toward zero, which this formula relies on for months < 3.
-/// (Computed in i64 so pathological date ranges cannot overflow; Fortran
-/// 32-bit integers would wrap only beyond ~68-year spans.)
-fn julian_date(yyyy: i32, mm: i32, dd: i32) -> i64 {
-    let (yyyy, mm, dd) = (yyyy as i64, mm as i64, dd as i64);
-    dd - 32075 + 1461 * (yyyy + 4800 + (mm - 14) / 12) / 4
-        + 367 * (mm - 2 - ((mm - 14) / 12) * 12) / 12
-        - 3 * ((yyyy + 4900 + (mm - 14) / 12) / 100) / 4
-}
-
-/// Seconds between two `yyyymmdd hhmmss` strings (date2 - date1), as
-/// `time_difference` in `src/snapwave_date.f90` computes for the globals
-/// `tstart`/`tstop` (seconds relative to `tref`).
-fn seconds_between(date1: &str, date2: &str) -> Result<f64> {
-    let (y1, m1, d1, h1, n1, s1) = parse_date15(date1)?;
-    let (y2, m2, d2, h2, n2, s2) = parse_date15(date2)?;
-    let jul1 = julian_date(y1, m1, d1);
-    let jul2 = julian_date(y2, m2, d2);
-    let sec1 = (h1 as i64) * 3600 + (n1 as i64) * 60 + s1 as i64;
-    let sec2 = (h2 as i64) * 3600 + (n2 as i64) * 60 + s2 as i64;
-    Ok(((jul2 - jul1) * 86400 + sec2 - sec1) as f64)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::date::{julian_date, parse_date15};
 
     /// `8.0 * atan(1.0)` in single-precision arithmetic, so the test
     /// assertions compute exactly the same value as the parser's runtime

@@ -7,6 +7,7 @@
 //! configuration-related console chatter.
 
 use crate::input::SnapWaveInput;
+use crate::state::DomainState;
 use crate::text_input::{BoundaryInput, ParsedTextInputs, WindInput};
 
 /// Emit the informational messages that the legacy Fortran reader used to
@@ -55,4 +56,30 @@ pub fn report_text_input_diagnostics(text: &ParsedTextInputs) {
         None => "none".to_string(),
     };
     eprintln!("text inputs: obs {obs}; boundary {boundary}; wind {wind}; enclosure {enc}; neumann {neu}");
+}
+
+/// Verbose summary of the Phase 8 state handoff: what the Rust-owned
+/// domain state contains before the buffers cross to Fortran. Emitted
+/// only in verbose mode, just before the facade call.
+pub fn report_domain_state_diagnostics(domain: &DomainState) {
+    let mode = match &domain.text.boundary {
+        BoundaryInput::None => "none".to_string(),
+        BoundaryInput::Single(j) => format!("single-point, {} records", j.len()),
+        BoundaryInput::Timeseries(s) => {
+            format!("timeseries, {} points x {} times", s.nwbnd, s.ntwbnd)
+        }
+    };
+    let obs = domain.text.obs.as_ref().map_or(0, |o| o.len());
+    eprintln!(
+        "domain state: Rust-owned mesh ({} nodes, {} faces, max {} nodes/face) + boundary ({mode}) + {obs} obs points handed to the Fortran core (plan.md Phase 8)",
+        domain.mesh.no_nodes, domain.mesh.no_faces, domain.mesh.max_nodes
+    );
+    eprintln!(
+        "runtime state: tstart {} s, tstop {} s, timestep {} s, map interval {} s, his interval {} s",
+        domain.runtime.tstart,
+        domain.runtime.tstop,
+        domain.runtime.timestep,
+        domain.runtime.map_interval,
+        domain.runtime.his_interval
+    );
 }

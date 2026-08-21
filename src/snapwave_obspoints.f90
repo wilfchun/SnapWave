@@ -106,6 +106,57 @@ contains
    !
    end subroutine
    !
+   subroutine init_obs_points_from_state()
+   !
+   ! plan.md Phase 8: the observation-point data (xobs, yobs, nameobs)
+   ! was associated from Rust-owned memory by the facade
+   ! (snapwave_run_capture_state_c). This routine performs the derived
+   ! part of read_obs_points — interpolation weights and output arrays —
+   ! without reading any file. The weight computation itself (make_map_fm)
+   ! stays Fortran until the Phase 9 interpolation migration.
+   !
+   use snapwave_data
+   use interp
+   !
+   implicit none
+   !
+   if (nobs > 0) then
+      !
+      ! Determine indices and weights of observation points
+      !
+      allocate(irefobs(4,nobs))
+      allocate(nrefobs(no_nodes))
+      allocate(wobs(4,nobs))
+     !
+      call make_map_fm (x, y, face_nodes, no_nodes, no_faces, xobs, yobs, nobs, wobs, irefobs, nrefobs)
+      !
+      ! Allocate arrays output variables at observation points
+      allocate(hm0obs(nobs))
+      allocate(zsobs(nobs))
+      allocate(tpobs(nobs))
+      allocate(hm0igobs(nobs))
+      allocate(dwobs(nobs))
+      allocate(dfobs(nobs))
+      allocate(stobs(nobs))
+      allocate(swobs(nobs))
+      allocate(wdobs(nobs))
+      allocate(dirsprobs(nobs))
+      !
+      hm0obs = FILL_VALUE
+      zsobs = FILL_VALUE
+      tpobs = FILL_VALUE
+      hm0igobs = FILL_VALUE
+      dwobs = FILL_VALUE
+      dfobs = FILL_VALUE
+      stobs = FILL_VALUE
+      swobs = FILL_VALUE
+      wdobs = FILL_VALUE
+      dirsprobs = FILL_VALUE
+      !
+   endif
+   !
+   end subroutine
+   !
    subroutine update_obs_points ()
     !
     use snapwave_data

@@ -1,13 +1,33 @@
    module snapwave_data
    !
+   ! plan.md Phase 8: the arrays below marked `pointer` are the non-solver
+   ! data whose allocation ownership moved to Rust (mesh, polylines,
+   ! observation points, boundary series). On the legacy routes they are
+   ! `allocate`d by the Fortran readers exactly as before (allocating a
+   ! pointer associates it with fresh Fortran memory); on the Rust-state
+   ! route (snapwave_run_capture_state_c) they are associated with
+   ! Rust-owned memory through c_f_pointer and no Fortran allocation
+   ! happens. Nothing may call allocated() on them (pointers associate,
+   ! they are not allocatable).
+   !
    ! Missing value
    real*4, parameter                           :: FILL_VALUE = -999999.
    !
-   real*8,  dimension(:),       allocatable    :: x, y                    ! x,y coordinates of grid (double precision)
-   real*4,  dimension(:),       allocatable    :: xs, ys                  ! x,y coordinates of grid (single precision)
+   ! x,y coordinates of grid (double precision); Rust-owned on the
+   ! Phase 8 state route.
+   real*8,  dimension(:),       pointer         :: x, y
+   ! x,y coordinates of grid (single precision); legacy-only (allocated
+   ! but never filled by the readers).
+   real*4,  dimension(:),       allocatable    :: xs, ys
    real*8                                      :: xmn, ymn
-   integer*1, dimension(:),     allocatable    :: msk                     ! mask array (0=land, 1=inner point, 2=boundary)
-   real*4,  dimension(:),       allocatable    :: zb, depth               ! bed level, water depth
+   ! mask array (0=land, 1=inner point, 2=boundary); Rust-owned on the
+   ! state route (note: initialize_snapwave_domain WRITES the enclosure /
+   ! neumann refinement into whatever msk points at).
+   integer*1, dimension(:),     pointer         :: msk
+   ! bed level; Rust-owned on the state route.
+   real*4,  dimension(:),       pointer         :: zb
+   ! water depth (solver-derived).
+   real*4,  dimension(:),       allocatable    :: depth
    real*4,  dimension(:),       allocatable    :: dhdx, dhdy              ! water depth gradients
    real*4,  dimension(:),       allocatable    :: kwav, nwav              ! wave number, ratio Cg/C
    real*4,  dimension(:),       allocatable    :: kwav_ig, nwav_ig        ! wave number, ratio Cg/C
@@ -47,7 +67,7 @@
    real*4,  dimension(:,:),     allocatable    :: ctheta_ig               ! refraction speed, per grid point and direction
    real*4,  dimension(:,:),     allocatable    :: ctheta360               ! refraction speed, per grid point and direction
    real*4,  dimension(:),       allocatable    :: dzdx,dzdy               ! bed slopes at nodes of unstructured grid
-   integer, dimension(:,:),     allocatable    :: face_nodes             ! node numbers connected to each cell
+   integer, dimension(:,:),     pointer        :: face_nodes             ! node numbers connected to each cell (Rust-owned on the state route)
  !  integer, dimension(:,:),     allocatable    :: edge_nodes             ! node numbers connected to each edge
    real*4,  dimension(:),       allocatable    :: bndindx
    real*4                                      :: Hmax
@@ -92,15 +112,17 @@
    real*4                                      :: tpmean_bwv=FILL_VALUE   ! mean tp over boundary points for given time
    real*4                                      :: wdmean_bwv=FILL_VALUE   ! mean wave direction for given time, used to make theta grid
    real*4                                      :: zsmean_bwv              ! mean water level for given time, used to make theta grid
-   real*8,  dimension(:),     allocatable      :: x_bwv                   ! x coordinates of boundary points
-   real*8,  dimension(:),     allocatable      :: y_bwv                   ! y coordinates of boundary points
-   real*4,  dimension(:),     allocatable      :: t_bwv                   ! times (s) of wave boundary conditions
+   ! Phase 8: boundary support-point coordinates and time column are
+   ! Rust-owned on the state route.
+   real*8,  dimension(:),     pointer          :: x_bwv                   ! x coordinates of boundary points
+   real*8,  dimension(:),     pointer          :: y_bwv                   ! y coordinates of boundary points
+   real*4,  dimension(:),     pointer          :: t_bwv                   ! times (s) of wave boundary conditions
    integer                                     :: n_bndenc                ! number of boundary enclosure points
-   real*8,  dimension(:),     allocatable      :: x_bndenc                ! x coordinates of boundary enclosure points
-   real*8,  dimension(:),     allocatable      :: y_bndenc                ! y coordinates of boundary enclosure points
+   real*8,  dimension(:),     pointer          :: x_bndenc                ! x coordinates of boundary enclosure points
+   real*8,  dimension(:),     pointer          :: y_bndenc                ! y coordinates of boundary enclosure points
    integer                                     :: n_neu                   ! number of neumann polyline points
-   real*8,  dimension(:),     allocatable      :: x_neu                   ! x coordinates of neumann polyline
-   real*8,  dimension(:),     allocatable      :: y_neu                   ! y coordinates of neumann polyline
+   real*8,  dimension(:),     pointer          :: x_neu                   ! x coordinates of neumann polyline
+   real*8,  dimension(:),     pointer          :: y_neu                   ! y coordinates of neumann polyline
    integer                                     :: nnmb                    ! number of neumann grid points
    real*4,  dimension(:),     allocatable      :: hst_bwv                 ! wave height at boundary points for given time
    real*4,  dimension(:),     allocatable      :: tpt_bwv                 ! wave period at boundary points for given time
@@ -109,11 +131,13 @@
    real*4,  dimension(:),     allocatable      :: zst_bwv                 ! water level at boundary points for given time
    real*4,  dimension(:,:),     allocatable    :: eet_bwv                 ! directional spectra at boundary points for given time
    !
-   real*4,  dimension(:,:),     allocatable    :: hs_bwv                  ! wave height for all boundary locations and time points
-   real*4,  dimension(:,:),     allocatable    :: tp_bwv                  ! wave period for all boundary locations and time points
-   real*4,  dimension(:,:),     allocatable    :: wd_bwv                  ! wave direction (nautical deg) for all boundary locations and time points
-   real*4,  dimension(:,:),     allocatable    :: ds_bwv                  ! directional spreading (deg) for all boundary locations and time points
-   real*4,  dimension(:,:),     allocatable    :: zs_bwv                  ! water level for all boundary locations and time points
+   ! Phase 8: the boundary series themselves are Rust-owned on the
+   ! state route (wd/ds arrive already converted to radians).
+   real*4,  dimension(:,:),     pointer        :: hs_bwv                  ! wave height for all boundary locations and time points
+   real*4,  dimension(:,:),     pointer        :: tp_bwv                  ! wave period for all boundary locations and time points
+   real*4,  dimension(:,:),     pointer        :: wd_bwv                  ! wave direction (nautical deg) for all boundary locations and time points
+   real*4,  dimension(:,:),     pointer        :: ds_bwv                  ! directional spreading (deg) for all boundary locations and time points
+   real*4,  dimension(:,:),     pointer        :: zs_bwv                  ! water level for all boundary locations and time points
    !
    integer                                     :: ntu10bnd                ! number of time points wind forcing boundary conditions
    integer*4                                   :: itwindbndlast
@@ -187,8 +211,11 @@
    character*256                             :: fwstr, fw_igstr     ! name of bed friction files OR uniform value of fw and fw_ig
    character*256                             :: u10str, u10dirstr   ! name of bed friction files OR uniform value of u10 and u10dir   
    integer                                   :: nobs
-   real*8,    dimension(:),    allocatable   :: xobs
-   real*8,    dimension(:),    allocatable   :: yobs
+   ! Phase 8: observation-point coordinates are Rust-owned on the state
+   ! route; nameobs stays allocatable (copied from the Rust name blob,
+   ! since character(len=32) arrays do not associate portably).
+   real*8,    dimension(:),    pointer       :: xobs
+   real*8,    dimension(:),    pointer       :: yobs
    integer ,  dimension(:,:),  allocatable   :: irefobs
    integer ,  dimension(:),    allocatable   :: nrefobs
    real*8  ,  dimension(:,:),  allocatable   :: wobs

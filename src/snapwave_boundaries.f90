@@ -213,6 +213,40 @@ contains
       !
    end subroutine read_boundary_data_timeseries
 !
+   subroutine init_boundary_from_state()
+      !
+      ! plan.md Phase 8: the boundary series globals (t_bwv, hs/tp/wd/ds/
+      ! zs_bwv, x_bwv, y_bwv; wd/ds already converted to radians) were
+      ! associated from Rust-owned memory by the facade. This routine
+      ! performs the derived part of read_boundary_data — the per-time
+      ! work arrays and the boundary-support-point interpolation
+      ! reference — without reading any file. find_boundary_indices stays
+      ! Fortran until the Phase 9 interpolation migration.
+      !
+      use snapwave_data
+      !
+      implicit none
+      !
+      itwbndlast = 2
+      itwindbndlast = 2
+      !
+      if (nwbnd > 0) then
+         !
+         allocate (hst_bwv(nwbnd))
+         allocate (tpt_bwv(nwbnd))
+         allocate (wdt_bwv(nwbnd))
+         allocate (dst_bwv(nwbnd))
+         allocate (zst_bwv(nwbnd))
+         allocate (eet_bwv(ntheta, nwbnd))
+         !
+      end if
+      !
+      ! Compute reference table between wave nwbd boundary support points and grid boundary points
+      !
+      call find_boundary_indices()
+      !
+   end subroutine init_boundary_from_state
+!
    subroutine find_boundary_indices()
       use snapwave_data
       use omp_lib

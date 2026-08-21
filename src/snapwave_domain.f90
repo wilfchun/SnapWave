@@ -3,7 +3,14 @@ module snapwave_domain
 
 contains
 
-subroutine initialize_snapwave_domain()
+subroutine initialize_snapwave_domain(mesh_from_rust)
+   !
+   ! plan.md Phase 8: with mesh_from_rust = .true. the mesh, enclosure
+   ! and Neumann globals were already associated with Rust-owned memory
+   ! by the facade (snapwave_run_capture_state_c), so the readers (and
+   ! the post-processing the Rust reader replicates: zb = -posdwn*zb and
+   ! the fourth-node -999 sentinel) are skipped. All callers omitting
+   ! the optional argument keep the legacy file-reading behaviour.
    !
    use snapwave_data
    use snapwave_results
@@ -13,15 +20,18 @@ subroutine initialize_snapwave_domain()
    !
    implicit none
    !
+   logical, intent(in), optional               :: mesh_from_rust
+   !
    ! Local input variables
    !
-   integer                                     :: k, j, ino, ic, m, n, itheta 
+   integer                                     :: k, j, ino, ic, m, n, itheta
    integer*4, dimension(:),     allocatable    :: indices
    real*8,    dimension(:),     allocatable    :: theta360d0 ! wave angles,sine and cosine of wave angles
    real*8,    dimension(:,:),   allocatable    :: ds360d0
    real*8,    dimension(:,:,:), allocatable    :: w360d0
    character*2                                 :: ext
    logical                                     :: file_exists
+   logical                                     :: from_rust
    !
    ! First set some constants
    !
@@ -29,11 +39,22 @@ subroutine initialize_snapwave_domain()
    cosrot = cos(rotation*deg2rad)
    sinrot = sin(rotation*deg2rad)
    !
+   from_rust = .false.
+   if (present(mesh_from_rust)) from_rust = mesh_from_rust
+   !
    write(*,*)'Initializing SnapWave domain ...'
    !
-   j=index(gridfile,'.')      
+   j=index(gridfile,'.')
    ext = gridfile(j+1:j+2)
-   if (ext=='nc') then
+   if (from_rust) then
+      !
+      ! Mesh (x, y, zb, msk, face_nodes) and the enclosure/neumann
+      ! polylines come from Rust-owned memory; nothing to read here.
+      ! kp is derived geometry and stays Fortran-allocated (Phase 9).
+      !
+      allocate(kp(np,no_nodes))
+   !
+   elseif (ext=='nc') then
       call nc_read_net()
       allocate(kp(np,no_nodes))
    !
@@ -205,11 +226,17 @@ subroutine initialize_snapwave_domain()
       !
    endif
    !
-   zb = -posdwn * zb
+   ! zb sign flip and fourth-node sentinel are already applied by the
+   ! Rust mesh reader (plan.md Phase 7/8); re-applying them here would
+   ! flip zb twice.
    !
-   do k=1,no_faces
-       if (face_nodes(4,k)==0) face_nodes(4,k) = -999
-   enddo 
+   if (.not. from_rust) then
+      zb = -posdwn * zb
+      !
+      do k=1,no_faces
+          if (face_nodes(4,k)==0) face_nodes(4,k) = -999
+      enddo
+   endif
    !
    ! keep on also if ja_vegetation==0, so array Dveg is initialized with zeroes
    if (ja_vegetation==1) then
@@ -357,10 +384,10 @@ subroutine initialize_snapwave_domain()
       ds360 = ds360d0*1.0
       w360  = w360d0*1.0
       !
-      !
-      ! Read polygon outlining valid boundary points
-      !
-      call read_boundary_enclosure ()
+       !
+       ! Read polygon outlining valid boundary points
+       !
+       if (.not. from_rust) call read_boundary_enclosure ()
 
       if (n_bndenc > 0) then
          !
@@ -374,10 +401,10 @@ subroutine initialize_snapwave_domain()
          enddo
          !
       endif
-      !
-      ! If present read neumann polyline
-      !
-      call read_neumann_boundary()
+       !
+       ! If present read neumann polyline
+       !
+       if (.not. from_rust) call read_neumann_boundary()
       if (n_neu>0) then
          !
          call neuboundaries(x,y,no_nodes,x_neu,y_neu,n_neu,tol,neumannconnected)

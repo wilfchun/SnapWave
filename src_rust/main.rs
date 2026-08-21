@@ -43,20 +43,55 @@
 //! file) and the Rust writers (`output`, built on the hand-rolled classic
 //! NetCDF writer in `netcdf`) write the map/history files.
 //!
+//! Phase 8 (plan.md): the non-solver domain data is explicit Rust state
+//! (`state::DomainState`: config, mesh, boundary forcing, wind, obs
+//! points, polylines, runtime scalars) and the run path hands it to the
+//! coarse Fortran entry point `snapwave_run_capture_state_c` as one
+//! `#[repr(C)]` struct of Rust-owned buffers — Fortran associates its
+//! module globals with that memory instead of re-reading the files
+//! (`ffi_layout` pins the one-based/column-major conversion facts).
+//! Grid formats the Rust mesh reader does not cover (structured
+//! index/mask, ASCII meshes) keep the Fortran readers, as does the
+//! `--legacy-mesh` parity hook used by `tests/domain_state.rs`.
+//!
+//! Phase 9 (plan.md): the derived geometry — surrounding points, upwind
+//! neighbours, observation interpolation weights, boundary support-point
+//! mapping — is ported to Rust (`geometry`, `interp`, `date`) and pinned
+//! against the unchanged Fortran routines by the `--compare-geometry` mode
+//! (`geometry_compare`, via the `snapwave_geometry_dump_c` hook). Fortran
+//! remains the runtime authority for the geometry; the ports exist to
+//! prove parity.
+//!
+//! Phase 10 (plan.md): the time loop and output scheduling move to Rust.
+//! Instead of Fortran's `run_time_loop`, Rust now drives the loop through
+//! coarse entry points: `snapwave_init_capture_c` (or the legacy variant)
+//! initialises the model and opens the capture stream, `snapwave_timestep_c`
+//! computes one solver step, `snapwave_capture_{map,his}_c` capture output
+//! when Rust's scheduling decides it is due, and
+//! `snapwave_finalize_capture_c` closes the stream. The existing
+//! `snapwave_run_capture_c` / `snapwave_run_capture_state_c` stay available
+//! for the `--legacy-mesh` parity hook and the comparison hooks.
+//!
 //! Status codes: 0 on success (including `--help`/`--version`), 2 on
 //! wrapper-detected errors, and any non-zero Fortran status is passed
 //! through unchanged.
 
 mod capture;
 mod cli;
+mod date;
 mod diagnostics;
+mod ffi_layout;
+mod geometry;
+mod geometry_compare;
 mod input;
 mod input_compare;
+mod interp;
 mod mesh;
 mod netcdf;
 mod output;
 mod paths;
 mod run_context;
+mod state;
 mod text_compare;
 mod text_input;
 
@@ -80,6 +115,19 @@ extern "C" {
         config_len: c_int,
         capture_path: *const c_char,
         capture_path_len: c_int,
+    ) -> c_int;
+
+    // plan.md Phase 8, step 5: the coarse Fortran entry point that
+    // consumes Rust-prepared state. `state` points at a
+    // `state::SnapWaveStateC` (the #[repr(C)] mirror of Fortran's
+    // snapwave_state_t) whose buffers Rust owns and keeps alive for the
+    // duration of the call.
+    fn snapwave_run_capture_state_c(
+        config: *const c_char,
+        config_len: c_int,
+        capture_path: *const c_char,
+        capture_path_len: c_int,
+        state: *const state::SnapWaveStateC,
     ) -> c_int;
 
     // Phase 3 comparison hook: parse the input file with the legacy
@@ -119,6 +167,61 @@ extern "C" {
         dump_path: *const c_char,
         dump_path_len: c_int,
     ) -> c_int;
+
+    // Phase 9 comparison hook: compute the derived geometry (surrounding
+    // points, upwind neighbours, observation weights, boundary mapping) with
+    // the unchanged Fortran routines and dump the resulting globals, pinning
+    // the Rust ports in `geometry`/`interp` against the numerical oracle.
+    fn snapwave_geometry_dump_c(
+        config: *const c_char,
+        config_len: c_int,
+        dump_path: *const c_char,
+        dump_path_len: c_int,
+    ) -> c_int;
+
+    // ---- plan.md Phase 10: Rust-owned time loop entry points ----------
+
+    // Initialise the model with Rust-owned state, open the capture stream
+    // and write static output data, but do NOT run the time loop.
+    fn snapwave_init_capture_c(
+        config: *const c_char,
+        config_len: c_int,
+        capture_path: *const c_char,
+        capture_path_len: c_int,
+        state: *const state::SnapWaveStateC,
+    ) -> c_int;
+
+    // Initialise the model by reading files (legacy route), open the
+    // capture stream and write static output data, but do NOT run the
+    // time loop.
+    fn snapwave_init_legacy_capture_c(
+        config: *const c_char,
+        config_len: c_int,
+        capture_path: *const c_char,
+        capture_path_len: c_int,
+    ) -> c_int;
+
+    // One solver timestep: update_boundary_conditions(t) + compute_wave_field(t).
+    fn snapwave_timestep_c(
+        t: f64,
+        it: c_int,
+    ) -> c_int;
+
+    // Capture map output at the current time (writes to the capture stream).
+    fn snapwave_capture_map_c(
+        t: f64,
+        ntmapout: c_int,
+    ) -> c_int;
+
+    // Capture history output at the current time: update_obs_points() +
+    // ncoutput_update_his (writes to the capture stream).
+    fn snapwave_capture_his_c(
+        t: f64,
+        nthisout: c_int,
+    ) -> c_int;
+
+    // Finalize the capture run: ncoutput_finalize() + ncoutput_capture_end().
+    fn snapwave_finalize_capture_c() -> c_int;
 }
 
 fn main() {
@@ -153,6 +256,13 @@ fn main() {
             }
         },
         Ok(Invocation::CompareMesh(cmd)) => match compare_mesh_with_fortran(cmd, exe) {
+            Ok(status) => status,
+            Err(err) => {
+                eprintln!("error: {err:#}");
+                EXIT_USAGE
+            }
+        },
+        Ok(Invocation::CompareGeometry(cmd)) => match compare_geometry_with_fortran(cmd, exe) {
             Ok(status) => status,
             Err(err) => {
                 eprintln!("error: {err:#}");
@@ -196,9 +306,11 @@ fn execute(cmd: cli::RunCommand, exe: ExeMeta) -> Result<i32> {
 
     // plan.md Phase 6: parse and validate every auxiliary text input in
     // Rust, so the data is Rust-owned before the timestep loop starts.
-    // The Fortran readers remain the runtime authority (they also compute
-    // interpolation weights that move in Phase 9); the Rust parse is
-    // validated against them by `--compare-text`.
+    // Since Phase 8 the obs points, polylines and boundary series also
+    // cross to Fortran as Rust state (below); the wind input stays
+    // Fortran-read until the Phase 9 value-or-file interpolation moves,
+    // and the Rust parse is validated against the Fortran readers by
+    // `--compare-text`.
     let text_inputs = text_input::parse_all(&run_paths, &config)?;
     if ctx.log.verbose {
         diagnostics::report_text_input_diagnostics(&text_inputs);
@@ -231,24 +343,144 @@ fn execute(cmd: cli::RunCommand, exe: ExeMeta) -> Result<i32> {
         bail!("capture path is too long for the FFI facade (>1024 bytes)");
     }
 
-    // Legacy chdir contract — isolated in RunContext until the plan.md
-    // Phase 8 mesh/data readers accept explicit paths.
-    ctx.enter_run_dir()?;
+    // plan.md Phase 8: when the Rust mesh reader owns this gridfile,
+    // hand the whole non-solver domain state (mesh, polylines, obs
+    // points, boundary series) to Fortran as Rust-owned buffers instead
+    // of letting the Fortran readers re-read the files. Other grid
+    // formats (structured index/mask, ASCII meshes) keep the Fortran
+    // readers, as does the `--legacy-mesh` parity hook. The dispatch
+    // mirrors the `ext == 'nc'` check of initialize_snapwave_domain
+    // verbatim (see state::rust_owns_gridfile).
+    let use_rust_state =
+        !cmd.legacy_mesh && state::rust_owns_gridfile(&config.grid.gridfile);
 
-    let status = unsafe {
-        snapwave_run_capture_c(
-            c_text.as_ptr(),
-            c_text.as_bytes().len() as c_int,
-            c_capture.as_ptr(),
-            c_capture.as_bytes().len() as c_int,
-        )
+    let ffi_state = if use_rust_state {
+        let gridfile = run_paths
+            .gridfile
+            .as_ref()
+            .context("the NetCDF mesh route requires a gridfile")?;
+        let mesh =
+            mesh::read_ugrid_netcdf(gridfile, config.grid.posdwn, config.grid.sferic)?;
+        let domain = state::DomainState::new(&config, &mesh, &text_inputs);
+        if ctx.log.verbose {
+            diagnostics::report_domain_state_diagnostics(&domain);
+        }
+        Some(state::FfiState::build(&domain)?)
+    } else {
+        None
     };
 
-    // Preserve the Fortran exit status semantics: a non-zero status fails
-    // the process with the same code, and no output is written.
-    if status != 0 {
-        let _ = std::fs::remove_file(&capture_path);
-        return Ok(status);
+    // Legacy chdir contract — isolated in RunContext until the plan.md
+    // Phase 9 readers (wind/fw value-or-file inputs) accept explicit
+    // paths. The Phase 8 handoff removed the mesh/text-file reads on
+    // the Rust-state route, but the remaining Fortran-side file opens
+    // still resolve CWD-relative.
+    ctx.enter_run_dir()?;
+
+    // plan.md Phase 10: Rust-owned time loop and output scheduling.
+    // When `--fortran-time-loop` is set (a hidden test hook), use the
+    // old Fortran-owned time loop path for parity comparison.
+    if cmd.fortran_time_loop {
+        let status = unsafe {
+            match &ffi_state {
+                Some(ffi) => {
+                    let c_state = ffi.c_state();
+                    snapwave_run_capture_state_c(
+                        c_text.as_ptr(),
+                        c_text.as_bytes().len() as c_int,
+                        c_capture.as_ptr(),
+                        c_capture.as_bytes().len() as c_int,
+                        &c_state as *const state::SnapWaveStateC,
+                    )
+                }
+                None => snapwave_run_capture_c(
+                    c_text.as_ptr(),
+                    c_text.as_bytes().len() as c_int,
+                    c_capture.as_ptr(),
+                    c_capture.as_bytes().len() as c_int,
+                ),
+            }
+        };
+
+        if status != 0 {
+            let _ = std::fs::remove_file(&capture_path);
+            return Ok(status);
+        }
+    } else {
+        // ---- Phase 10: Rust-owned time loop -------------------------------
+        let init_status = unsafe {
+            match &ffi_state {
+                Some(ffi) => {
+                    let c_state = ffi.c_state();
+                    snapwave_init_capture_c(
+                        c_text.as_ptr(),
+                        c_text.as_bytes().len() as c_int,
+                        c_capture.as_ptr(),
+                        c_capture.as_bytes().len() as c_int,
+                        &c_state as *const state::SnapWaveStateC,
+                    )
+                }
+                None => snapwave_init_legacy_capture_c(
+                    c_text.as_ptr(),
+                    c_text.as_bytes().len() as c_int,
+                    c_capture.as_ptr(),
+                    c_capture.as_bytes().len() as c_int,
+                ),
+            }
+        };
+
+        if init_status != 0 {
+            let _ = std::fs::remove_file(&capture_path);
+            return Ok(init_status);
+        }
+
+        let mut model = state::ModelState::new(&config);
+        let nobs = text_inputs.obs.as_ref().map_or(0, |o| o.points.len() as i32);
+        let map_file_nonempty = !config.output.map_file.is_empty();
+        let his_file_nonempty = !config.output.his_file.is_empty();
+
+        while model.is_running() {
+            model.advance_iteration();
+
+            let step_status = unsafe { snapwave_timestep_c(model.t, model.it) };
+            if step_status != 0 {
+                unsafe { snapwave_finalize_capture_c(); }
+                let _ = std::fs::remove_file(&capture_path);
+                return Ok(step_status);
+            }
+
+            // History output check (mirrors the Fortran order: his before map).
+            if model.should_output_his(his_file_nonempty, nobs) {
+                model.record_his_output(config.output.his_interval);
+                let his_status =
+                    unsafe { snapwave_capture_his_c(model.t, model.his_output_count) };
+                if his_status != 0 {
+                    unsafe { snapwave_finalize_capture_c(); }
+                    let _ = std::fs::remove_file(&capture_path);
+                    return Ok(his_status);
+                }
+            }
+
+            // Map output check.
+            if model.should_output_map(config.output.ja_save_each_iter, map_file_nonempty) {
+                model.record_map_output(config.output.map_interval);
+                let map_status =
+                    unsafe { snapwave_capture_map_c(model.t, model.map_output_count) };
+                if map_status != 0 {
+                    unsafe { snapwave_finalize_capture_c(); }
+                    let _ = std::fs::remove_file(&capture_path);
+                    return Ok(map_status);
+                }
+            }
+
+            model.advance_time();
+        }
+
+        let final_status = unsafe { snapwave_finalize_capture_c() };
+        if final_status != 0 {
+            let _ = std::fs::remove_file(&capture_path);
+            return Ok(final_status);
+        }
     }
 
     let capture = capture::read_capture(&capture_path, &config)?;
@@ -478,6 +710,82 @@ fn compare_mesh_with_fortran(cmd: cli::RunCommand, exe: ExeMeta) -> Result<i32> 
 
     if ctx.log.verbose {
         eprintln!("mesh: Rust read matches the Fortran nc_read_net ({count} values compared)");
+    }
+    Ok(0)
+}
+
+/// `--compare-geometry`: compute the derived geometry (surrounding points,
+/// upwind neighbours, observation interpolation weights, boundary
+/// support-point mapping) in Rust, run the unchanged Fortran routines
+/// through the temporary Phase 9 hook, and compare the resulting globals.
+/// Exits 0 on agreement, without running the model (plan.md Phase 9).
+fn compare_geometry_with_fortran(cmd: cli::RunCommand, exe: ExeMeta) -> Result<i32> {
+    let ctx = RunContext::new(cmd.input, exe, LogPrefs { verbose: cmd.verbose })?;
+    let config = input::parse_file(&ctx.input_path)?;
+    let run_paths = paths::RunPaths::resolve(&ctx.run_dir, &config);
+
+    let gridfile = run_paths
+        .gridfile
+        .as_ref()
+        .context("geometry comparison requires a gridfile")?;
+    if !state::rust_owns_gridfile(&config.grid.gridfile) {
+        bail!(
+            "geometry comparison only supports NetCDF meshes (gridfile '{}' is not one); \
+             the ASCII/structured mesh geometry is not yet Rust-owned",
+            config.grid.gridfile
+        );
+    }
+
+    // Rust-side geometry from the Rust-owned mesh and text inputs.
+    let mesh = mesh::read_ugrid_netcdf(gridfile, config.grid.posdwn, config.grid.sferic)?;
+    let text = text_input::parse_all(&run_paths, &config)?;
+    let geometry = geometry_compare::compute_geometry(&mesh, &config, &text);
+    if ctx.log.verbose {
+        eprintln!(
+            "geometry: Rust computed {} surrounding-point lists, {} upwind directions, {} boundary nodes",
+            geometry.domain.no_nodes, geometry.domain.ntheta360, geometry.domain.nb
+        );
+    }
+
+    // The Fortran hook reads the mesh and sibling boundary files relative to
+    // the run directory (same chdir contract as a real run).
+    ctx.enter_run_dir()?;
+
+    let text_config = config.to_config_text();
+    let c_text = std::ffi::CString::new(text_config)
+        .with_context(|| "config text contains an embedded NUL byte")?;
+
+    let dump_path =
+        std::env::temp_dir().join(format!("snapwave-geometry-dump-{}.txt", std::process::id()));
+    let c_dump = path_to_cstring(&dump_path)?;
+    // The facade buffers file paths as character(len=1024).
+    if c_dump.as_bytes().len() > 1024 {
+        bail!("dump path is too long for the FFI facade (>1024 bytes)");
+    }
+
+    let status = unsafe {
+        snapwave_geometry_dump_c(
+            c_text.as_ptr(),
+            c_text.as_bytes().len() as c_int,
+            c_dump.as_ptr(),
+            c_dump.as_bytes().len() as c_int,
+        )
+    };
+    if status != 0 {
+        let _ = std::fs::remove_file(&dump_path);
+        bail!("the Fortran geometry routines (initialize_snapwave_domain/read_obs_points/read_boundary_data) failed with status {status}");
+    }
+
+    let dump_text = std::fs::read_to_string(&dump_path)
+        .with_context(|| format!("reading the Fortran geometry dump at {}", dump_path.display()))?;
+    let _ = std::fs::remove_file(&dump_path);
+
+    let count = geometry_compare::check(&geometry, &dump_text).with_context(|| {
+        format!("comparing the Rust and Fortran geometry of {}", gridfile.display())
+    })?;
+
+    if ctx.log.verbose {
+        eprintln!("geometry: Rust computation matches the Fortran routines ({count} values compared)");
     }
     Ok(0)
 }

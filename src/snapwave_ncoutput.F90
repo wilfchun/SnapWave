@@ -952,8 +952,17 @@ contains
       allocate (ys(no_nodes))
       allocate (zb(no_nodes))
       allocate (msk(no_nodes))
-      allocate (face_nodes(4, no_faces))
-      allocate (face_nodes_temp(max_nodes, no_faces))
+       allocate (face_nodes(4, no_faces))
+       ! For a triangle mesh (max_nodes == 3) only rows 1..max_nodes are
+       ! filled below, leaving row 4 uninitialized. The "no fourth node"
+       ! sentinel fix-ups downstream (initialize_snapwave_domain and the
+       ! comparison hooks) only convert 0 to -999, so garbage survived and
+       ! crashed fm_surrounding_points with an out-of-bounds node index
+       ! when the heap was dirty (e.g. after the Rust wrapper's own work
+       ! in the same process). Zero-initialize to make the sentinel
+       ! deterministic; numerically identical to the fresh-heap case.
+       face_nodes = 0
+       allocate (face_nodes_temp(max_nodes, no_faces))
       !allocate (edge_nodes(2, no_edges))
       !
       ierror = nf90_get_var(idfile, idvar_node_x, x, start=(/1/), count=(/no_nodes/)); call nc_check_err(ierror, "get_var x", gridfile)

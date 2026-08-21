@@ -24,6 +24,52 @@ module snapwave_c_api
    !************************************************************************
    use iso_c_binding
    implicit none
+   !
+   ! Width of the nameobs global (character*32), see snapwave_data.
+   integer, parameter :: WIDTH_NAMEOBS = 32
+   !
+   ! The bind(C) mirror of the Rust #[repr(C)] struct SnapWaveStateC
+   ! (src_rust/state.rs). Field order and widths must stay identical on
+   ! both sides (AGENTS.md FFI rule). Absent data is zero extents plus
+   ! empty (zero-length) buffers, never null pointers.
+   !
+   type, bind(C) :: snapwave_state_t
+      ! ---- mesh
+      integer(c_int) :: no_nodes
+      integer(c_int) :: no_faces
+      integer(c_int) :: max_nodes
+      integer(c_int) :: sferic
+      type(c_ptr)    :: x
+      type(c_ptr)    :: y
+      type(c_ptr)    :: zb
+      type(c_ptr)    :: msk
+      type(c_ptr)    :: face_nodes
+      ! ---- boundary enclosure polyline
+      integer(c_int) :: n_bndenc
+      type(c_ptr)    :: x_bndenc
+      type(c_ptr)    :: y_bndenc
+      ! ---- neumann polyline
+      integer(c_int) :: n_neu
+      type(c_ptr)    :: x_neu
+      type(c_ptr)    :: y_neu
+      ! ---- observation points
+      integer(c_int) :: nobs
+      type(c_ptr)    :: xobs
+      type(c_ptr)    :: yobs
+      type(c_ptr)    :: names
+      ! ---- boundary forcing series
+      integer(c_int) :: boundary_mode
+      integer(c_int) :: nwbnd
+      integer(c_int) :: ntwbnd
+      type(c_ptr)    :: x_bwv
+      type(c_ptr)    :: y_bwv
+      type(c_ptr)    :: t_bwv
+      type(c_ptr)    :: hs_bwv
+      type(c_ptr)    :: tp_bwv
+      type(c_ptr)    :: wd_bwv
+      type(c_ptr)    :: ds_bwv
+      type(c_ptr)    :: zs_bwv
+   end type snapwave_state_t
 contains
    function snapwave_run_c(config, config_len) bind(C, name="snapwave_run_c") result(status)
       use snapwave_data
@@ -155,23 +201,485 @@ contains
          return
       end if
 
-      call ncoutput_capture_begin(cu)
-      call ncoutput_init()
-      call run_time_loop()
-      call ncoutput_finalize()
-      call ncoutput_capture_end()
+      call run_capture_tail(cu)
 
       close (cu)
       status = 0_c_int
       !
    end function snapwave_run_capture_c
 
+   !************************************************************************
+   ! plan.md Phase 8: coarse Fortran entry point that consumes
+   ! Rust-prepared state. Mirrors snapwave_run_capture_c, except the
+   ! mesh, the enclosure/neumann polylines, the observation points and
+   ! the boundary series are not read from disk: they were parsed and
+   ! validated in Rust (plan.md Phases 6-7) and are associated here
+   ! with Rust-owned memory through associate_state_from_rust, so the
+   ! allocation ownership of those non-solver arrays is Rust's
+   ! (Phase 8, steps 4-5). Derived quantities (surrounding points,
+   ! upwind neighbours, make_map_fm / find_boundary_indices weights)
+   ! and the remaining file-backed inputs (wind, fw/fwig, vegetation)
+   ! stay Fortran until the Phase 9 interpolation migration; the legacy
+   ! make-built oracle keeps reading every file itself.
+   !************************************************************************
+   function snapwave_run_capture_state_c(config, config_len, capture_path, capture_path_len, state) &
+         bind(C, name="snapwave_run_capture_state_c") result(status)
+      use snapwave_data
+      use snapwave_input
+      use snapwave_domain
+      use snapwave_boundaries
+      use snapwave_ncoutput
+      use snapwave_obspoints
+      implicit none
+
+      type(c_ptr), value :: config
+      integer(c_int), value :: config_len
+      type(c_ptr), value :: capture_path
+      integer(c_int), value :: capture_path_len
+      type(c_ptr), value :: state
+      integer(c_int) :: status
+
+      character(len=:), allocatable :: ftext
+      character(len=1024) :: cpath
+      character(kind=c_char), dimension(:), pointer :: cchars
+      type(snapwave_state_t), pointer :: st
+      integer :: i, du, ios, cu, istat
+
+      status = 1_c_int
+
+      allocate (character(len=config_len) :: ftext)
+      call c_f_pointer(config, cchars, [config_len])
+      do i = 1, config_len
+         ftext(i:i) = achar(iachar(cchars(i)))
+      end do
+      call c_f_pointer(capture_path, cchars, [capture_path_len])
+      cpath = ' '
+      do i = 1, capture_path_len
+         cpath(i:i) = achar(iachar(cchars(i)))
+      end do
+
+      open (newunit=du, status='scratch', action='readwrite', iostat=ios)
+      if (ios /= 0) then
+         write (*, *) 'ERROR: snapwave_run_capture_state_c: cannot open scratch file for config'
+         return
+      end if
+      call write_config_lines(du, ftext)
+      call read_resolved_input(du)
+      close (du)
+
+      ! Associate the snapwave_data globals with the Rust-owned buffers.
+      call c_f_pointer(state, st)
+      call associate_state_from_rust(st, istat)
+      if (istat /= 0) then
+         write (*, *) 'ERROR: snapwave_run_capture_state_c: rejecting Rust state'
+         return
+      end if
+
+      call initialize_snapwave_domain(mesh_from_rust=.true.)
+      call init_obs_points_from_state()
+      call init_boundary_from_state()
+      call read_wind_data()
+
+      open (newunit=cu, file=trim(cpath), form='unformatted', access='stream', &
+            action='write', status='replace', iostat=ios)
+      if (ios /= 0) then
+         write (*, *) 'ERROR: snapwave_run_capture_state_c: cannot open capture file: ', trim(cpath)
+         return
+      end if
+
+      call run_capture_tail(cu)
+
+      close (cu)
+      status = 0_c_int
+      !
+   end function snapwave_run_capture_state_c
+
+!************************************************************************
+    ! plan.md Phase 10: Rust-owned time loop and output scheduling.
+    !
+    ! Instead of the Fortran run_time_loop driving the model, Rust now
+    ! owns the time loop and calls these coarse entry points:
+    !   - snapwave_init_capture_c       (Rust-state route: init + capture)
+    !   - snapwave_init_legacy_capture_c (legacy route: init + capture)
+    !   - snapwave_timestep_c           (one solver step)
+    !   - snapwave_capture_map_c        (capture map output at current t)
+    !   - snapwave_capture_his_c        (capture his output at current t)
+    !   - snapwave_finalize_capture_c   (close capture stream)
+    !
+    ! The existing snapwave_run_capture_c / snapwave_run_capture_state_c
+    ! stay available for the --legacy-mesh parity hook and the comparison
+    ! hooks; they are unchanged.
+    !************************************************************************
+
+    !************************************************************************
+    ! Phase 10: initialize the model with Rust-owned state, open the
+    ! capture stream and write the static output data, but do NOT run the
+    ! time loop. The caller (Rust) will drive the loop through
+    ! snapwave_timestep_c / snapwave_capture_{map,his}_c and finalize
+    ! with snapwave_finalize_capture_c.
+    !
+    ! Mirrors snapwave_run_capture_state_c up to (and including)
+    ! ncoutput_init, then returns — the time loop is Rust-owned.
+    !************************************************************************
+    function snapwave_init_capture_c(config, config_len, capture_path, capture_path_len, state) &
+          bind(C, name="snapwave_init_capture_c") result(status)
+       use snapwave_data
+       use snapwave_input
+       use snapwave_domain
+       use snapwave_boundaries
+       use snapwave_ncoutput
+       use snapwave_obspoints
+       implicit none
+
+       type(c_ptr), value :: config
+       integer(c_int), value :: config_len
+       type(c_ptr), value :: capture_path
+       integer(c_int), value :: capture_path_len
+       type(c_ptr), value :: state
+       integer(c_int) :: status
+
+       character(len=:), allocatable :: ftext
+       character(len=1024) :: cpath
+       character(kind=c_char), dimension(:), pointer :: cchars
+       type(snapwave_state_t), pointer :: st
+       integer :: i, du, ios, cu, istat
+
+       status = 1_c_int
+
+       allocate (character(len=config_len) :: ftext)
+       call c_f_pointer(config, cchars, [config_len])
+       do i = 1, config_len
+          ftext(i:i) = achar(iachar(cchars(i)))
+       end do
+       call c_f_pointer(capture_path, cchars, [capture_path_len])
+       cpath = ' '
+       do i = 1, capture_path_len
+          cpath(i:i) = achar(iachar(cchars(i)))
+       end do
+
+       open (newunit=du, status='scratch', action='readwrite', iostat=ios)
+       if (ios /= 0) then
+          write (*, *) 'ERROR: snapwave_init_capture_c: cannot open scratch file for config'
+          return
+       end if
+       call write_config_lines(du, ftext)
+       call read_resolved_input(du)
+       close (du)
+
+       ! Associate the snapwave_data globals with the Rust-owned buffers.
+       call c_f_pointer(state, st)
+       call associate_state_from_rust(st, istat)
+       if (istat /= 0) then
+          write (*, *) 'ERROR: snapwave_init_capture_c: rejecting Rust state'
+          return
+       end if
+
+       call initialize_snapwave_domain(mesh_from_rust=.true.)
+       call init_obs_points_from_state()
+       call init_boundary_from_state()
+       call read_wind_data()
+
+       open (newunit=cu, file=trim(cpath), form='unformatted', access='stream', &
+             action='write', status='replace', iostat=ios)
+       if (ios /= 0) then
+          write (*, *) 'ERROR: snapwave_init_capture_c: cannot open capture file: ', trim(cpath)
+          return
+       end if
+
+       call run_init_tail(cu)
+
+       status = 0_c_int
+       !
+    end function snapwave_init_capture_c
+
+    !************************************************************************
+    ! Phase 10: initialize the model by reading files (legacy route),
+    ! open the capture stream and write the static output data, but do
+    ! NOT run the time loop. Mirrors snapwave_run_capture_c up to (and
+    ! including) ncoutput_init.
+    !************************************************************************
+    function snapwave_init_legacy_capture_c(config, config_len, capture_path, capture_path_len) &
+          bind(C, name="snapwave_init_legacy_capture_c") result(status)
+       use snapwave_data
+       use snapwave_input
+       use snapwave_domain
+       use snapwave_boundaries
+       use snapwave_ncoutput
+       use snapwave_obspoints
+       implicit none
+
+       type(c_ptr), value :: config
+       integer(c_int), value :: config_len
+       type(c_ptr), value :: capture_path
+       integer(c_int), value :: capture_path_len
+       integer(c_int) :: status
+
+       character(len=:), allocatable :: ftext
+       character(len=1024) :: cpath
+       character(kind=c_char), dimension(:), pointer :: cchars
+       integer :: i, du, ios, cu
+
+       status = 1_c_int
+
+       allocate (character(len=config_len) :: ftext)
+       call c_f_pointer(config, cchars, [config_len])
+       do i = 1, config_len
+          ftext(i:i) = achar(iachar(cchars(i)))
+       end do
+       call c_f_pointer(capture_path, cchars, [capture_path_len])
+       cpath = ' '
+       do i = 1, capture_path_len
+          cpath(i:i) = achar(iachar(cchars(i)))
+       end do
+
+       open (newunit=du, status='scratch', action='readwrite', iostat=ios)
+       if (ios /= 0) then
+          write (*, *) 'ERROR: snapwave_init_legacy_capture_c: cannot open scratch file for config'
+          return
+       end if
+       call write_config_lines(du, ftext)
+       call read_resolved_input(du)
+       close (du)
+
+       call initialize_snapwave_domain()
+       call read_obs_points()
+       call read_boundary_data()
+       call read_wind_data()
+
+       open (newunit=cu, file=trim(cpath), form='unformatted', access='stream', &
+             action='write', status='replace', iostat=ios)
+       if (ios /= 0) then
+          write (*, *) 'ERROR: snapwave_init_legacy_capture_c: cannot open capture file: ', trim(cpath)
+          return
+       end if
+
+       call run_init_tail(cu)
+
+       status = 0_c_int
+       !
+    end function snapwave_init_legacy_capture_c
+
+    !************************************************************************
+    ! Phase 10: one solver timestep. Calls update_boundary_conditions(t)
+    ! and compute_wave_field(t) — exactly what run_time_loop does per
+    ! iteration. The caller (Rust) owns the time loop and output
+    ! scheduling.
+    !************************************************************************
+    function snapwave_timestep_c(t, it) bind(C, name="snapwave_timestep_c") result(status)
+       use snapwave_data
+       use snapwave_boundaries
+       use snapwave_solver
+       implicit none
+
+       real(c_double), value :: t
+       integer(c_int), value :: it
+       integer(c_int) :: status
+
+       call update_boundary_conditions(t)
+       call compute_wave_field(t)
+
+       status = 0_c_int
+       !
+    end function snapwave_timestep_c
+
+    !************************************************************************
+    ! Phase 10: capture map output at the current time. Calls
+    ! ncoutput_update_map(t, ntmapout), which writes to the capture
+    ! stream when capture mode is active (set by run_init_tail).
+    !************************************************************************
+    function snapwave_capture_map_c(t, ntmapout) bind(C, name="snapwave_capture_map_c") result(status)
+       use snapwave_data
+       use snapwave_ncoutput
+       implicit none
+
+       real(c_double), value :: t
+       integer(c_int), value :: ntmapout
+       integer(c_int) :: status
+
+       call ncoutput_update_map(t, ntmapout)
+
+       status = 0_c_int
+       !
+    end function snapwave_capture_map_c
+
+    !************************************************************************
+    ! Phase 10: capture history output at the current time. Calls
+    ! update_obs_points() then ncoutput_update_his(t, nthisout), which
+    ! writes to the capture stream when capture mode is active.
+    !************************************************************************
+    function snapwave_capture_his_c(t, nthisout) bind(C, name="snapwave_capture_his_c") result(status)
+       use snapwave_data
+       use snapwave_ncoutput
+       use snapwave_obspoints
+       implicit none
+
+       real(c_double), value :: t
+       integer(c_int), value :: nthisout
+       integer(c_int) :: status
+
+       call update_obs_points()
+       call ncoutput_update_his(t, nthisout)
+
+       status = 0_c_int
+       !
+    end function snapwave_capture_his_c
+
+    !************************************************************************
+    ! Phase 10: finalize the capture run. Calls ncoutput_finalize(),
+    ! closes the capture stream file (which was opened by the init
+    ! function — the unit is saved in snapwave_ncoutput's capture_unit),
+    ! and resets capture mode.
+    !************************************************************************
+    function snapwave_finalize_capture_c() bind(C, name="snapwave_finalize_capture_c") result(status)
+       use snapwave_ncoutput, only: ncoutput_finalize, ncoutput_capture_end, capture_unit
+       implicit none
+
+       integer(c_int) :: status
+       integer :: ios
+
+       call ncoutput_finalize()
+       close (capture_unit, iostat=ios)
+       call ncoutput_capture_end()
+
+       status = 0_c_int
+       !
+    end function snapwave_finalize_capture_c
+
+    !************************************************************************
+    ! Shared Phase 10 init tail: open the capture stream and write the
+    ! static output data (ncoutput_capture_begin + ncoutput_init). Called
+    ! by both snapwave_init_capture_c and snapwave_init_legacy_capture_c
+    ! after the domain/boundary/wind initialisation is done.
+    !************************************************************************
+    subroutine run_init_tail(cu)
+       !
+       use snapwave_ncoutput
+       implicit none
+       !
+       integer, intent(in) :: cu
+       !
+       call ncoutput_capture_begin(cu)
+       call ncoutput_init()
+       !
+    end subroutine run_init_tail
+
+    !************************************************************************
+    ! Associate the Phase 8 snapwave_data globals with the Rust-owned
+    ! buffers of one snapwave_state_t (plan.md Phase 8, step 4: the
+    ! allocation ownership of these non-solver arrays is Rust's; the
+    ! Fortran side only points at the memory). nameobs is the one
+    ! exception: character(len=32) arrays do not associate portably, so
+    ! the names are copied from the packed 32-byte records.
+    !
+    ! Buffer layouts (pinned by tests in src_rust/ffi_layout.rs):
+    !   face_nodes : (4, no_faces)      column-major
+    !   *_bwv      : (nwbnd, ntwbnd)    column-major
+    !   msk        : integer*1 (c_int8_t)
+    !************************************************************************
+    subroutine associate_state_from_rust(st, status)
+      use snapwave_data
+      implicit none
+
+      type(snapwave_state_t), intent(in) :: st
+      integer, intent(out) :: status
+
+      character(kind=c_char), dimension(:), pointer :: cname
+      integer :: i, j
+      integer(c_size_t) :: sz_nodes, sz_faces, sz_enc, sz_neu, sz_obs, sz_bnd, sz_t
+
+      status = 1
+
+      if (st%no_nodes < 0 .or. st%no_faces < 0 .or. st%max_nodes < 0 .or. st%nobs < 0 &
+            .or. st%n_bndenc < 0 .or. st%n_neu < 0 .or. st%nwbnd < 0 .or. st%ntwbnd < 0) then
+         write (*, *) 'ERROR: associate_state_from_rust: negative array extent in Rust state'
+         return
+      end if
+
+      ! ---- mesh
+      no_nodes = st%no_nodes
+      no_faces = st%no_faces
+      max_nodes = st%max_nodes
+      sferic    = st%sferic
+      sz_nodes = int(no_nodes, c_size_t)
+      sz_faces = int(no_faces, c_size_t)
+      call c_f_pointer(st%x, x, [sz_nodes])
+      call c_f_pointer(st%y, y, [sz_nodes])
+      call c_f_pointer(st%zb, zb, [sz_nodes])
+      call c_f_pointer(st%msk, msk, [sz_nodes])
+      call c_f_pointer(st%face_nodes, face_nodes, [4_c_size_t, sz_faces])
+      ! xs/ys are legacy-only (allocated, never filled); the state route
+      ! leaves them unallocated, matching their unused status.
+
+      ! ---- polylines
+      n_bndenc = st%n_bndenc
+      sz_enc = int(n_bndenc, c_size_t)
+      call c_f_pointer(st%x_bndenc, x_bndenc, [sz_enc])
+      call c_f_pointer(st%y_bndenc, y_bndenc, [sz_enc])
+      n_neu = st%n_neu
+      sz_neu = int(n_neu, c_size_t)
+      call c_f_pointer(st%x_neu, x_neu, [sz_neu])
+      call c_f_pointer(st%y_neu, y_neu, [sz_neu])
+
+      ! ---- observation points
+      nobs = st%nobs
+      sz_obs = int(nobs, c_size_t)
+      call c_f_pointer(st%xobs, xobs, [sz_obs])
+      call c_f_pointer(st%yobs, yobs, [sz_obs])
+      if (nobs > 0) then
+         call c_f_pointer(st%names, cname, [int(WIDTH_NAMEOBS, c_size_t) * sz_obs])
+         allocate (nameobs(nobs))
+         do i = 1, nobs
+            do j = 1, WIDTH_NAMEOBS
+               nameobs(i) (j:j) = achar(iachar(cname(WIDTH_NAMEOBS*(i - 1) + j)))
+            end do
+         end do
+      end if
+
+      ! ---- boundary forcing series (wd/ds already converted to radians)
+      nwbnd  = st%nwbnd
+      ntwbnd = st%ntwbnd
+      sz_bnd = int(nwbnd, c_size_t)
+      sz_t = int(ntwbnd, c_size_t)
+      call c_f_pointer(st%x_bwv, x_bwv, [sz_bnd])
+      call c_f_pointer(st%y_bwv, y_bwv, [sz_bnd])
+      call c_f_pointer(st%t_bwv, t_bwv, [sz_t])
+      call c_f_pointer(st%hs_bwv, hs_bwv, [sz_bnd, sz_t])
+      call c_f_pointer(st%tp_bwv, tp_bwv, [sz_bnd, sz_t])
+      call c_f_pointer(st%wd_bwv, wd_bwv, [sz_bnd, sz_t])
+      call c_f_pointer(st%ds_bwv, ds_bwv, [sz_bnd, sz_t])
+      call c_f_pointer(st%zs_bwv, zs_bwv, [sz_bnd, sz_t])
+
+      status = 0
+      !
+   end subroutine associate_state_from_rust
+
+   subroutine run_capture_tail(cu)
+      !
+      ! Shared Phase 7 capture tail of snapwave_run_capture_c and
+      ! snapwave_run_capture_state_c: initialize the output in capture
+      ! mode, run the timestep loop, finalize.
+      !
+      use snapwave_ncoutput
+      implicit none
+      !
+      integer, intent(in) :: cu
+      !
+      call ncoutput_capture_begin(cu)
+      call ncoutput_init()
+      call run_time_loop()
+      call ncoutput_finalize()
+      call ncoutput_capture_end()
+      !
+   end subroutine run_capture_tail
+
    subroutine run_time_loop()
       !
-      ! Timestep loop shared by snapwave_run_c (NetCDF output) and
-      ! snapwave_run_capture_c (Phase 7 capture output). The model stepping
-      ! and the output scheduling are identical; the two facades differ only
-      ! in how ncoutput_* handles each output time.
+      ! Timestep loop shared by snapwave_run_c (NetCDF output),
+      ! snapwave_run_capture_c and snapwave_run_capture_state_c (Phase 7/8
+      ! capture output). The model stepping and the output scheduling are
+      ! identical; the facades differ only in how ncoutput_* handles each
+      ! output time and in where the input data comes from (files vs the
+      ! Rust-owned state).
       !
       use snapwave_data
       use snapwave_boundaries
@@ -887,4 +1395,203 @@ contains
        bits = transfer(v, bits)
        write (u, '(Z8.8)') bits
     end subroutine dump_r4_line
-end module snapwave_c_api
+
+    !************************************************************************
+    ! plan.md Phase 9 hook: compute the *derived geometry* — surrounding
+    ! points and upwind neighbours (initialize_snapwave_domain), observation
+    ! interpolation weights (read_obs_points -> make_map_fm) and boundary
+    ! support-point mapping (read_boundary_data -> find_boundary_indices) —
+    ! with the unchanged Fortran routines and dump the resulting globals, so
+    ! the Rust ports (src_rust/geometry.rs, src_rust/interp.rs) can be pinned
+    ! against the numerical oracle. Mirrors snapwave_text_dump_c but stops
+    ! before read_wind_data (wind is not geometry) and dumps the geometry
+    ! globals instead of the parsed-text globals.
+    !
+    ! Dump format (parsed by src_rust/geometry_compare.rs): `section <name>`
+    ! blocks of `key value` lines. Array keys (kp, dhdx, dhdy, w360, prev360,
+    ! ds360, msk, neumannconnected, nmindbnd, neubnd, wobs, irefobs, nrefobs,
+    ! ind1_bwv_cst, ind2_bwv_cst, fac_bwv_cst) carry a count and then one
+    ! value per line: reals as IEEE-754 bit patterns (real*8 Z16.16, real*4
+    ! Z8.8), integers decimal. Scalar keys (no_nodes, np, ntheta360, nb,
+    ! nnmb, nobs, nwbnd) carry a single value. Array order is Fortran
+    ! column-major over the natural do-loop order; see dump_geometry_globals.
+    !************************************************************************
+    function snapwave_geometry_dump_c(config, config_len, dump_path, dump_path_len) &
+          bind(C, name="snapwave_geometry_dump_c") result(status)
+       use snapwave_data
+       use snapwave_input
+       use snapwave_domain
+       use snapwave_boundaries
+       use snapwave_obspoints
+       implicit none
+
+       type(c_ptr), value :: config
+       integer(c_int), value :: config_len
+       type(c_ptr), value :: dump_path
+       integer(c_int), value :: dump_path_len
+       integer(c_int) :: status
+
+       character(len=:), allocatable :: ftext
+       character(len=1024) :: dpath
+       character(kind=c_char), dimension(:), pointer :: cchars
+       integer :: i, ios, dunit, du
+
+       status = 1_c_int
+
+       allocate (character(len=config_len) :: ftext)
+       call c_f_pointer(config, cchars, [config_len])
+       do i = 1, config_len
+          ftext(i:i) = achar(iachar(cchars(i)))
+       end do
+       call c_f_pointer(dump_path, cchars, [dump_path_len])
+       dpath = ' '
+       do i = 1, dump_path_len
+          dpath(i:i) = achar(iachar(cchars(i)))
+       end do
+
+       open (newunit=du, status='scratch', action='readwrite', iostat=ios)
+       if (ios /= 0) then
+          write (*, *) 'ERROR: snapwave_geometry_dump_c: cannot open scratch file for config'
+          return
+       end if
+       call write_config_lines(du, ftext)
+       call read_resolved_input(du)
+       close (du)
+
+       ! Compute the geometry: mesh + enclosure/neumann (surrounding points,
+       ! upwind neighbours, mask refinement), observation interpolation
+       ! weights, and boundary support-point mapping.
+       call initialize_snapwave_domain()
+       call read_obs_points()
+       call read_boundary_data()
+
+       open (newunit=dunit, file=trim(dpath), status='replace', action='write', iostat=ios)
+       if (ios /= 0) then
+          write (*, *) 'ERROR: snapwave_geometry_dump_c: cannot open dump file: ', trim(dpath)
+          return
+       end if
+
+       call dump_geometry_globals(dunit)
+
+       close (dunit)
+       !
+       status = 0_c_int
+       !
+    end function snapwave_geometry_dump_c
+
+    subroutine dump_geometry_globals(u)
+       !
+       ! Dump the derived-geometry globals produced by
+       ! initialize_snapwave_domain + read_obs_points + read_boundary_data,
+       ! in the format described above. Keep the field/array order in
+       ! lock-step with src_rust/geometry_compare.rs.
+       !
+       use snapwave_data
+       implicit none
+       integer, intent(in) :: u
+       integer :: k, ip, itheta
+
+       write (u, '(A)') 'section domain'
+       write (u, '(A,1X,I0)') 'no_nodes', no_nodes
+       write (u, '(A,1X,I0)') 'np', np
+       write (u, '(A,1X,I0)') 'ntheta360', ntheta360
+       write (u, '(A,1X,I0)') 'nb', nb
+       write (u, '(A,1X,I0)') 'nnmb', nnmb
+       write (u, '(A,1X,I0)') 'kp', np*no_nodes
+       do k = 1, no_nodes
+          do ip = 1, np
+             write (u, '(I0)') kp(ip, k)
+          end do
+       end do
+       write (u, '(A,1X,I0)') 'dhdx', no_nodes
+       do k = 1, no_nodes
+          call dump_r4_line(u, dhdx(k))
+       end do
+       write (u, '(A,1X,I0)') 'dhdy', no_nodes
+       do k = 1, no_nodes
+          call dump_r4_line(u, dhdy(k))
+       end do
+       write (u, '(A,1X,I0)') 'w360', 2*ntheta360*no_nodes
+       do k = 1, no_nodes
+          do itheta = 1, ntheta360
+             do ip = 1, 2
+                call dump_r4_line(u, w360(ip, itheta, k))
+             end do
+          end do
+       end do
+       write (u, '(A,1X,I0)') 'prev360', 2*ntheta360*no_nodes
+       do k = 1, no_nodes
+          do itheta = 1, ntheta360
+             do ip = 1, 2
+                write (u, '(I0)') prev360(ip, itheta, k)
+             end do
+          end do
+       end do
+       write (u, '(A,1X,I0)') 'ds360', ntheta360*no_nodes
+       do k = 1, no_nodes
+          do itheta = 1, ntheta360
+             call dump_r4_line(u, ds360(itheta, k))
+          end do
+       end do
+       write (u, '(A,1X,I0)') 'msk', no_nodes
+       do k = 1, no_nodes
+          write (u, '(I0)') msk(k)
+       end do
+       write (u, '(A,1X,I0)') 'neumannconnected', no_nodes
+       do k = 1, no_nodes
+          write (u, '(I0)') neumannconnected(k)
+       end do
+       write (u, '(A,1X,I0)') 'nmindbnd', nb
+       do k = 1, nb
+          write (u, '(I0)') nmindbnd(k)
+       end do
+       if (nnmb > 0) then
+          write (u, '(A,1X,I0)') 'neubnd', nnmb
+          do k = 1, nnmb
+             write (u, '(I0)') neubnd(k)
+          end do
+       end if
+
+       write (u, '(A)') 'section obs'
+       write (u, '(A,1X,I0)') 'nobs', nobs
+       if (nobs > 0) then
+          write (u, '(A,1X,I0)') 'wobs', 4*nobs
+          do k = 1, nobs
+             do ip = 1, 4
+                call dump_r8_line(u, wobs(ip, k))
+             end do
+          end do
+          write (u, '(A,1X,I0)') 'irefobs', 4*nobs
+          do k = 1, nobs
+             do ip = 1, 4
+                write (u, '(I0)') irefobs(ip, k)
+             end do
+          end do
+          write (u, '(A,1X,I0)') 'nrefobs', no_nodes
+          do k = 1, no_nodes
+             write (u, '(I0)') nrefobs(k)
+          end do
+       end if
+
+       write (u, '(A)') 'section boundary'
+       write (u, '(A,1X,I0)') 'nwbnd', nwbnd
+       write (u, '(A,1X,I0)') 'nb', nb
+       if (nwbnd > 0 .and. nb > 0) then
+          write (u, '(A,1X,I0)') 'ind1_bwv_cst', nb
+          do k = 1, nb
+             write (u, '(I0)') ind1_bwv_cst(k)
+          end do
+          write (u, '(A,1X,I0)') 'ind2_bwv_cst', nb
+          do k = 1, nb
+             write (u, '(I0)') ind2_bwv_cst(k)
+          end do
+          write (u, '(A,1X,I0)') 'fac_bwv_cst', nb
+          do k = 1, nb
+             call dump_r4_line(u, fac_bwv_cst(k))
+          end do
+       end if
+
+       write (u, '(A)') 'section end'
+       !
+    end subroutine dump_geometry_globals
+ end module snapwave_c_api

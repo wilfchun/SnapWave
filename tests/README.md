@@ -17,6 +17,8 @@ build internals.
 | `output_dirs.rs` | Phase-5 filesystem tests: nested run directories, wrapper-created output parents, disabled map/history output |
 | `text_input.rs` | Phase-6 text-reader tests: `--compare-text` parity against the Fortran readers on checked-in cases |
 | `netcdf_io.rs` | Phase-7 NetCDF tests: `--compare-mesh` parity against the Fortran `nc_read_net` reader on checked-in meshes |
+| `domain_state.rs` | Phase-8 route-parity tests: default Rust-state handoff vs `--legacy-mesh` Fortran-reading route |
+| `geometry.rs` | Phase-9 geometry tests: `--compare-geometry` parity against the Fortran geometry routines on checked-in meshes |
 | `ncdf_parser.rs` | Self-tests of the NetCDF reader against committed fixtures (no model run) |
 | `support/ncdf.rs` | Dependency-free reader for NetCDF classic (CDF-1/CDF-2) files |
 | `support/harness.rs` | Testcase copying, separator normalization, wrapper/oracle execution |
@@ -112,6 +114,54 @@ Fortran schema (dimensions, variable names, attribute strings, fill values,
 ordering and time indexing) and fills the variables SnapWave never writes
 (`mesh2d`, `crs`, `station_id`, `point_zb`, `total_runtime`, `average_dt`)
 with the NetCDF default fill values.
+
+## Domain and mesh data structures (Phase 8)
+
+Since Phase 8 the wrapper's default run path no longer lets Fortran re-read
+the migrated inputs for NetCDF-grid cases: the mesh, the enclosure/Neumann
+polylines, the observation points and the boundary series cross as
+Rust-owned buffers through `snapwave_run_capture_state_c`
+(`src_rust/state.rs`; Fortran associates its `snapwave_data` globals with
+that memory instead of reading files). Grid formats the Rust mesh reader
+does not cover (structured index/mask, ASCII meshes) keep the
+Fortran-reading route, and the hidden `--legacy-mesh` flag forces that
+route for NetCDF grids too.
+
+`domain_state.rs` pins the handoff by running each case both ways and
+comparing the outputs strictly (same record counts) — case 31 covers the
+boundary *time series* mode, case 32 the *single-point JONSWAP* mode.
+This works without the `make`-built oracle; `regression.rs` adds the
+oracle comparison when one exists. The layout/indexing conversion facts
+(one-based indices, column-major offsets, `integer*1` mask narrowing,
+`character*32` name packing, degree→radian recipes) are unit-tested in
+`src_rust/ffi_layout.rs` and `src_rust/state.rs`.
+
+## Geometry, interpolation, and lookup utilities (Phase 9)
+
+`geometry.rs` exercises the Phase-9 comparison hook through the wrapper's
+`--compare-geometry` mode: the Rust ports in `src_rust/geometry.rs` (mesh
+preprocessing — surrounding points, upwind neighbours, plane fit, Neumann
+connections, boundary support-point mapping) and `src_rust/interp.rs`
+(observation interpolation weights via `make_map_fm`) compute the same
+derived geometry as the unchanged Fortran routines, and every resulting
+global must agree (integers exact; reals bit-exact first, then the
+1e-6/1e-9 relative tolerances, since the geometry uses `hypot`/`tan`/
+`atan2` libm results that may drift one ulp between runtimes). Like
+`--compare-text`/`--compare-mesh` this needs the mesh, so the checked-in
+cases are copied to a temp dir (separators normalized in the copy) and the
+hook runs `initialize_snapwave_domain` + `read_obs_points` +
+`read_boundary_data` before dumping. Cases 31 (triangles), 32 (quads), 33
+and 45 cover the geometry on representative meshes.
+
+The small deterministic helpers are unit-tested with hand-checked fixtures
+in `src_rust/interp.rs` (binary search, linear interpolation, point-in-
+polygon, bilinear/triangle weights, `make_map_fm`, the trapezoidal/cyclic
+integrals, the curvilinear `make_map`/`grmap` family) and
+`src_rust/geometry.rs` (plane fit, `intersect_angle`, Neumann connections,
+`find_boundary_indices`). The date/time utilities live in
+`src_rust/date.rs`. The sample-point `triintfast`/Triangle/`kdtree2` path
+stays Fortran by the decision recorded in `plan.md` Phase 9 and the
+`src_rust/geometry.rs` module docs.
 
 ## Output-directory handling (Phase 5)
 
