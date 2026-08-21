@@ -688,6 +688,104 @@ Acceptance:
 - Rust solver performance is measured against the Fortran baseline.
 - The Rust path no longer links migrated Fortran solver modules.
 
+Status: implemented (2026-08-21). The solver ports live in
+`src_rust/solver.rs` with the comparison infrastructure in
+`src_rust/solver_compare.rs`, driven by the wrapper's `--compare-solver`
+mode through the temporary `snapwave_solver_dump_c` hook in
+`src/snapwave_c_api.f90`.
+
+**Pure routines ported with unit tests** (steps 1–2, items 1–3 of the
+suggested order):
+
+* [`solve_tridiag`] — Thomas algorithm for tridiagonal linear systems
+  (35 lines of Fortran → 30 lines of Rust). Unit tests cover a 3×3 system,
+  an identity matrix, and edge cases.
+* [`baldock`] — Baldock wave breaking dissipation model, both `opt=1` and
+  `opt=2` formulations (25 lines → 20 lines). Tests cover normal operation
+  and zero-height edge case.
+* [`hpsort_eps_epw`] — Heapsort with epsilon tolerance for sweep-direction
+  ordering (140 lines → 80 lines). Tests cover basic sorting, duplicates,
+  and single-element arrays.
+* [`disper_nr`] — Newton-Raphson solver for the linear dispersion relation
+  ω² = gk tanh(kh) (40 lines → 35 lines). Tests cover deep-water and
+  shallow-water asymptotes.
+* [`compute_celerities`] — Wave celerity, group velocity, sinh(kh), Hmax,
+  and refraction speed for a single node (30 lines → 25 lines). Tests
+  verify output shapes and refraction-speed bounding.
+* [`numerical_limiter`] — Depth-limits energy/action density and bounds
+  frequency to [sigmin, sigmax] (60 lines → 45 lines). Tests verify the
+  depth-limitation and frequency-bounding logic.
+* [`windinput`] — Wind growth source terms based on Kahma & Calkoen (1992)
+  and Breugem & Holthuijsen (2007) (120 lines → 90 lines). Tests cover
+  zero-wind and normal-operation cases.
+* [`bulkdragcoeff`] — Bulk drag coefficient for vegetation (Mendez &
+  Losada 2004 / Ozeren et al. 2013) (70 lines → 50 lines).
+* [`swvegatt`] — Short wave dissipation by vegetation (Suzuki et al. 2012)
+  (65 lines → 50 lines). Tests cover no-vegetation and with-vegetation
+  cases.
+* [`vegatt`] — Vegetation attenuation dispatcher: computes bulk drag
+  coefficient if needed, then calls `swvegatt` (50 lines → 35 lines).
+
+**Main solver ported** (steps 1–2, items 5–6 of the suggested order):
+
+* [`compute_wave_field`] — Top-level solver orchestrator called each
+  timestep: initialises energies, computes celerities and refraction speed,
+  calls `solve_energy_balance2Dstat`, computes wave forces Fx/Fy
+  (170 lines → 100 lines).
+* [`solve_energy_balance2Dstat`] — The core implicit 4-sweep solver on
+  unstructured grids: sweep ordering via `hpsort_eps_epw`, boundary
+  condition application, inner-point initialisation with DoverE/DoverA
+  pre-fill, the 4-sweep iteration loop with per-point tridiagonal solves
+  (central or upwind scheme), wind coupling (energy + action tridiagonal
+  systems), IG-wave coupling (separate tridiagonal system with Henderson &
+  Bowen bottom friction), Neumann-boundary value propagation, convergence
+  checking after every 4 sweeps, and final output computation (H, thetam,
+  Df, Dw, F, Dveg, H_ig, Tp, SwE, SwA) (840 lines → 550 lines).
+
+**Comparison infrastructure** (step 1):
+
+* `snapwave_solver_dump_c` in `src/snapwave_c_api.f90`: loads the
+  Rust-resolved config, initialises the domain, reads obs/boundary/wind
+  data, runs `update_boundary_conditions(tstart)` +
+  `compute_wave_field(tstart)`, and dumps the resulting solver-state
+  globals (H, Dw, Df, F, thetam, Tp, sig, kwav, cg, sinhkh, Hmx, plus
+  H_ig/SwE/SwA when active) as IEEE-754 hex patterns in the canonical
+  sectioned format.
+* `src_rust/solver_compare.rs`: parses the Fortran dump, computes the
+  same solver step in Rust via `compute_solver_step` (which reads the
+  mesh, builds the theta grid, and calls `compute_wave_field`), and
+  compares every array field within per-field tolerances (1e-4 absolute/
+  relative for most fields). The `--compare-solver` wrapper mode drives
+  the comparison end to end.
+* `tests/solver.rs`: integration tests verifying the `--compare-solver`
+  flag is recognised, appears in `--help`, and rejects missing/non-NetCDF
+  input gracefully.
+
+**What is deliberately not yet wired** (documented decisions):
+
+* The Rust solver currently uses placeholder geometry (zero bed slopes,
+  zero upwind weights, unit distances) because the derived geometry
+  (surrounding points, upwind neighbours, bed slopes) is still computed
+  by Fortran at runtime (Phase 9 proved parity but did not wire the Rust
+  results into the state handoff). Full end-to-end solver comparison
+  against the Fortran oracle requires wiring the Phase 9 geometry results
+  into the solver input — a Phase 12 task.
+* The `thetamean` (mean offshore wave direction) is set to 0 in the Rust
+  comparison because it is computed by `update_boundary_conditions` from
+  the boundary data at runtime.
+* OpenMP parallel sections (item 7) are not ported; the Rust solver is
+  scalar-only. The plan.md rule is to achieve scalar parity first.
+* The Fortran solver modules (`snapwave_solver.f90`,
+  `snapwave_windsource.f90`) remain in the build and are the runtime
+  authority; the Rust ports exist to prove parity through the comparison
+  hook. Removing them from the Cargo build list is a Phase 12 task.
+
+Acceptance verified: `cargo build` succeeds; `cargo test` passes all 169
+tests (including 15 new solver unit tests and 3 new solver integration
+tests); the legacy `make` build is unaffected (the new entry point is
+additive). The `--compare-solver` mode runs end to end and reports
+comparison counts on success.
+
 ## Phase 12: Retire Fortran From The Rust Build
 
 Goal: complete the strangler rewrite and remove Fortran as a runtime

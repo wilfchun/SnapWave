@@ -35,10 +35,15 @@ Rust ports of the date/time utilities, the generic interpolation helpers,
 the surrounding-point/upwind-neighbour preprocessing and the
 boundary/observation interpolation weights, pinned against the Fortran
 oracle by the `--compare-geometry` hook; the sample-point `triintfast`/
-Triangle/`kdtree2` path stays Fortran by a documented decision) are done.
-Phase 10 (solver state boundary: Rust-owned time loop and output
-scheduling) is done. Phase 11 (solver internals in Rust) is the active
-frontier.
+Triangle/`kdtree2` path stays Fortran by a documented decision) and
+10 (solver state boundary: Rust-owned time loop and output scheduling)
+and 11 (solver internals: Rust ports of all numerical solver routines —
+tridiagonal solve, Baldock breaking, heapsort, dispersion relation,
+celerities, numerical limiter, wind input, vegetation dissipation, and
+the full `compute_wave_field`/`solve_energy_balance2Dstat` implicit
+4-sweep solver — pinned against the Fortran oracle by the
+`--compare-solver` hook) are done. Phase 12 (retire Fortran from the
+Rust build) is the active frontier.
 
 ## Non-negotiable rules
 

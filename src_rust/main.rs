@@ -91,6 +91,8 @@ mod netcdf;
 mod output;
 mod paths;
 mod run_context;
+mod solver;
+mod solver_compare;
 mod state;
 mod text_compare;
 mod text_input;
@@ -222,6 +224,17 @@ extern "C" {
 
     // Finalize the capture run: ncoutput_finalize() + ncoutput_capture_end().
     fn snapwave_finalize_capture_c() -> c_int;
+
+    // ---- plan.md Phase 11: solver comparison hook ------------------------
+    // Run the unchanged Fortran solver for one timestep and dump the
+    // resulting solver-state globals, so the Rust ports (solver.rs) can
+    // be pinned against the numerical oracle.
+    fn snapwave_solver_dump_c(
+        config: *const c_char,
+        config_len: c_int,
+        dump_path: *const c_char,
+        dump_path_len: c_int,
+    ) -> c_int;
 }
 
 fn main() {
@@ -263,6 +276,13 @@ fn main() {
             }
         },
         Ok(Invocation::CompareGeometry(cmd)) => match compare_geometry_with_fortran(cmd, exe) {
+            Ok(status) => status,
+            Err(err) => {
+                eprintln!("error: {err:#}");
+                EXIT_USAGE
+            }
+        },
+        Ok(Invocation::CompareSolver(cmd)) => match compare_solver_with_fortran(cmd, exe) {
             Ok(status) => status,
             Err(err) => {
                 eprintln!("error: {err:#}");
@@ -786,6 +806,79 @@ fn compare_geometry_with_fortran(cmd: cli::RunCommand, exe: ExeMeta) -> Result<i
 
     if ctx.log.verbose {
         eprintln!("geometry: Rust computation matches the Fortran routines ({count} values compared)");
+    }
+    Ok(0)
+}
+
+/// `--compare-solver`: run the unchanged Fortran solver for one timestep
+/// through the temporary Phase 11 hook, compute the same solver step in
+/// Rust, and compare the resulting solver-state globals. Exits 0 on
+/// agreement, without running the full model (plan.md Phase 11).
+fn compare_solver_with_fortran(cmd: cli::RunCommand, exe: ExeMeta) -> Result<i32> {
+    let ctx = RunContext::new(cmd.input, exe, LogPrefs { verbose: cmd.verbose })?;
+    let config = input::parse_file(&ctx.input_path)?;
+    let run_paths = paths::RunPaths::resolve(&ctx.run_dir, &config);
+
+    let gridfile = run_paths
+        .gridfile
+        .as_ref()
+        .context("solver comparison requires a gridfile")?;
+    if !state::rust_owns_gridfile(&config.grid.gridfile) {
+        bail!(
+            "solver comparison only supports NetCDF meshes (gridfile '{}' is not one)",
+            config.grid.gridfile
+        );
+    }
+
+    // Rust-side: read mesh, parse text inputs, compute solver step
+    let mesh = mesh::read_ugrid_netcdf(gridfile, config.grid.posdwn, config.grid.sferic)?;
+    let text = text_input::parse_all(&run_paths, &config)?;
+    let rust_result = solver_compare::compute_solver_step(&mesh, &config, &text);
+    if ctx.log.verbose {
+        eprintln!(
+            "solver: Rust computed one timestep for {} nodes, {} directions",
+            rust_result.no_nodes, rust_result.ntheta
+        );
+    }
+
+    // The Fortran hook reads the mesh and sibling files relative to the
+    // run directory (same chdir contract as a real run).
+    ctx.enter_run_dir()?;
+
+    let text_config = config.to_config_text();
+    let c_text = std::ffi::CString::new(text_config)
+        .with_context(|| "config text contains an embedded NUL byte")?;
+
+    let dump_path =
+        std::env::temp_dir().join(format!("snapwave-solver-dump-{}.txt", std::process::id()));
+    let c_dump = path_to_cstring(&dump_path)?;
+    if c_dump.as_bytes().len() > 1024 {
+        bail!("dump path is too long for the FFI facade (>1024 bytes)");
+    }
+
+    let status = unsafe {
+        snapwave_solver_dump_c(
+            c_text.as_ptr(),
+            c_text.as_bytes().len() as c_int,
+            c_dump.as_ptr(),
+            c_dump.as_bytes().len() as c_int,
+        )
+    };
+    if status != 0 {
+        let _ = std::fs::remove_file(&dump_path);
+        bail!("the Fortran solver (compute_wave_field) failed with status {status}");
+    }
+
+    let dump_text = std::fs::read_to_string(&dump_path)
+        .with_context(|| format!("reading the Fortran solver dump at {}", dump_path.display()))?;
+    let _ = std::fs::remove_file(&dump_path);
+
+    let count = solver_compare::check(&rust_result, &dump_text).with_context(|| {
+        format!("comparing the Rust and Fortran solver results of {}", gridfile.display())
+    })?;
+
+    if ctx.log.verbose {
+        eprintln!("solver: Rust computation matches the Fortran solver ({count} values compared)");
     }
     Ok(0)
 }

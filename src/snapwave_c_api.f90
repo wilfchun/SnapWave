@@ -1591,7 +1591,182 @@ contains
           end do
        end if
 
-       write (u, '(A)') 'section end'
-       !
-    end subroutine dump_geometry_globals
+write (u, '(A)') 'section end'
+        !
+     end subroutine dump_geometry_globals
+
+     !************************************************************************
+     ! plan.md Phase 11 hook: run the unchanged Fortran solver for one
+     ! timestep and dump the resulting solver-state globals, so the Rust
+     ! ports (src_rust/solver.rs) can be pinned against the numerical oracle.
+     !
+     ! Dump format (parsed by src_rust/solver_compare.rs): `section <name>`
+     ! blocks of `key value` lines. Array keys carry a count and then one
+     ! value per line: reals as IEEE-754 bit patterns (real*4 Z8.8),
+     ! integers decimal. Scalar keys carry a single value. Array order is
+     ! Fortran column-major over the natural do-loop order.
+     !************************************************************************
+     function snapwave_solver_dump_c(config, config_len, dump_path, dump_path_len) &
+           bind(C, name="snapwave_solver_dump_c") result(status)
+        use snapwave_data
+        use snapwave_input
+        use snapwave_domain
+        use snapwave_boundaries
+        use snapwave_obspoints
+        use snapwave_solver
+        use snapwave_ncoutput
+        implicit none
+
+        type(c_ptr), value :: config
+        integer(c_int), value :: config_len
+        type(c_ptr), value :: dump_path
+        integer(c_int), value :: dump_path_len
+        integer(c_int) :: status
+
+        character(len=:), allocatable :: ftext
+        character(len=1024) :: dpath
+        character(kind=c_char), dimension(:), pointer :: cchars
+        integer :: i, ios, dunit, du
+
+        status = 1_c_int
+
+        allocate (character(len=config_len) :: ftext)
+        call c_f_pointer(config, cchars, [config_len])
+        do i = 1, config_len
+           ftext(i:i) = achar(iachar(cchars(i)))
+        end do
+        call c_f_pointer(dump_path, cchars, [dump_path_len])
+        dpath = ' '
+        do i = 1, dump_path_len
+           dpath(i:i) = achar(iachar(cchars(i)))
+        end do
+
+        open (newunit=du, status='scratch', action='readwrite', iostat=ios)
+        if (ios /= 0) then
+           write (*, *) 'ERROR: snapwave_solver_dump_c: cannot open scratch file for config'
+           return
+        end if
+        call write_config_lines(du, ftext)
+        call read_resolved_input(du)
+        close (du)
+
+        ! Initialize domain, read obs/boundary/wind, then run one timestep.
+        call initialize_snapwave_domain()
+        call read_obs_points()
+        call read_boundary_data()
+        call read_wind_data()
+
+        ! Initialize output (needed for some globals like map_filename)
+        call ncoutput_init()
+
+        ! Update boundary conditions for t=tstart and run one solver step
+        call update_boundary_conditions(tstart)
+        call compute_wave_field(tstart)
+
+        open (newunit=dunit, file=trim(dpath), status='replace', action='write', iostat=ios)
+        if (ios /= 0) then
+           write (*, *) 'ERROR: snapwave_solver_dump_c: cannot open dump file: ', trim(dpath)
+           return
+        end if
+
+        call dump_solver_globals(dunit)
+
+        close (dunit)
+        !
+        status = 0_c_int
+        !
+     end function snapwave_solver_dump_c
+
+     subroutine dump_solver_globals(u)
+        !
+        ! Dump the solver-state globals produced by one call to
+        ! compute_wave_field, in the format described above. Keep the
+        ! field/array order in lock-step with src_rust/solver_compare.rs.
+        !
+        use snapwave_data
+        implicit none
+        integer, intent(in) :: u
+        integer :: k, itheta
+
+        write (u, '(A)') 'section solver'
+        write (u, '(A,1X,I0)') 'no_nodes', no_nodes
+        write (u, '(A,1X,I0)') 'ntheta', ntheta
+        write (u, '(A,1X,I0)') 'ig', ig
+        write (u, '(A,1X,I0)') 'wind', wind
+
+        write (u, '(A,1X,I0)') 'H', no_nodes
+        do k = 1, no_nodes
+           call dump_r4_line(u, H(k))
+        end do
+        write (u, '(A,1X,I0)') 'Dw', no_nodes
+        do k = 1, no_nodes
+           call dump_r4_line(u, Dw(k))
+        end do
+        write (u, '(A,1X,I0)') 'Df', no_nodes
+        do k = 1, no_nodes
+           call dump_r4_line(u, Df(k))
+        end do
+        write (u, '(A,1X,I0)') 'F', no_nodes
+        do k = 1, no_nodes
+           call dump_r4_line(u, F(k))
+        end do
+        write (u, '(A,1X,I0)') 'thetam', no_nodes
+        do k = 1, no_nodes
+           call dump_r4_line(u, thetam(k))
+        end do
+        write (u, '(A,1X,I0)') 'Tp', no_nodes
+        do k = 1, no_nodes
+           call dump_r4_line(u, Tp(k))
+        end do
+        write (u, '(A,1X,I0)') 'sig', no_nodes
+        do k = 1, no_nodes
+           call dump_r4_line(u, sig(k))
+        end do
+        write (u, '(A,1X,I0)') 'kwav', no_nodes
+        do k = 1, no_nodes
+           call dump_r4_line(u, kwav(k))
+        end do
+        write (u, '(A,1X,I0)') 'cg', no_nodes
+        do k = 1, no_nodes
+           call dump_r4_line(u, Cg(k))
+        end do
+        write (u, '(A,1X,I0)') 'sinhkh', no_nodes
+        do k = 1, no_nodes
+           call dump_r4_line(u, sinhkh(k))
+        end do
+        write (u, '(A,1X,I0)') 'Hmx', no_nodes
+        do k = 1, no_nodes
+           call dump_r4_line(u, Hmx(k))
+        end do
+
+        ! Directional energy density (first 5 nodes to keep dump manageable)
+        write (u, '(A,1X,I0)') 'ee_nodes', min(5, no_nodes)
+        do k = 1, min(5, no_nodes)
+           write (u, '(A,1X,I0)') 'ee', ntheta
+           do itheta = 1, ntheta
+              call dump_r4_line(u, ee(itheta, k))
+           end do
+        end do
+
+        if (ig == 1) then
+           write (u, '(A,1X,I0)') 'H_ig', no_nodes
+           do k = 1, no_nodes
+              call dump_r4_line(u, H_ig(k))
+           end do
+        end if
+
+        if (wind == 1) then
+           write (u, '(A,1X,I0)') 'SwE', no_nodes
+           do k = 1, no_nodes
+              call dump_r4_line(u, SwE(k))
+           end do
+           write (u, '(A,1X,I0)') 'SwA', no_nodes
+           do k = 1, no_nodes
+              call dump_r4_line(u, SwA(k))
+           end do
+        end if
+
+        write (u, '(A)') 'section end'
+        !
+     end subroutine dump_solver_globals
  end module snapwave_c_api

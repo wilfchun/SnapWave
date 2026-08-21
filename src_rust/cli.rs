@@ -54,6 +54,10 @@ pub enum Invocation {
     /// temporary Phase 9 hook, and exit without running the model (plan.md
     /// Phase 9).
     CompareGeometry(RunCommand),
+    /// Run the unchanged Fortran solver for one timestep, compare against
+    /// the Rust solver port through the temporary Phase 11 hook, and exit
+    /// without running the model (plan.md Phase 11).
+    CompareSolver(RunCommand),
 }
 
 /// A requested model run, still unvalidated: input validation happens when
@@ -93,6 +97,7 @@ pub fn parse(args: &[OsString]) -> Result<Invocation, String> {
     let mut compare_text = false;
     let mut compare_mesh = false;
     let mut compare_geometry = false;
+    let mut compare_solver = false;
     let mut only_positional = false;
 
     for arg in args.iter().skip(1) {
@@ -116,6 +121,7 @@ pub fn parse(args: &[OsString]) -> Result<Invocation, String> {
             (true, Some("--compare-text")) => compare_text = true,
             (true, Some("--compare-mesh")) => compare_mesh = true,
             (true, Some("--compare-geometry")) => compare_geometry = true,
+            (true, Some("--compare-solver")) => compare_solver = true,
             (true, Some(other)) => return Err(format!("unknown option: {other}")),
             (true, None) => {
                 return Err(format!("unknown option: {}", arg.to_string_lossy()));
@@ -139,6 +145,7 @@ pub fn parse(args: &[OsString]) -> Result<Invocation, String> {
         Some(input) if compare_text => Ok(Invocation::CompareText(command(input))),
         Some(input) if compare_mesh => Ok(Invocation::CompareMesh(command(input))),
         Some(input) if compare_geometry => Ok(Invocation::CompareGeometry(command(input))),
+        Some(input) if compare_solver => Ok(Invocation::CompareSolver(command(input))),
         Some(input) => Ok(Invocation::Run(command(input))),
         None => Err(format!("missing input path (expected one {INPUT_FILE_HINT} file)")),
     }
@@ -186,12 +193,15 @@ Options:
   --compare-mesh   Read the mesh NetCDF (gridfile) in Rust and compare
                    against the unchanged Fortran nc_read_net reader, then
                    exit without running the model (plan.md Phase 7)
-  --compare-geometry
-                   Compute the derived geometry (surrounding points, upwind
-                   neighbours, observation weights, boundary support-point
-                   mapping) in Rust and compare against the Fortran
-                   routines, then exit without running the model (plan.md
-                   Phase 9)
+--compare-geometry
+                    Compute the derived geometry (surrounding points, upwind
+                    neighbours, observation weights, boundary support-point
+                    mapping) in Rust and compare against the Fortran
+                    routines, then exit without running the model (plan.md
+                    Phase 9)
+  --compare-solver  Run the unchanged Fortran solver for one timestep and
+                    compare against the Rust solver port, then exit without
+                    running the model (plan.md Phase 11)
   -h, --help     Print this help and exit
   -V, --version  Print version information and exit
 
