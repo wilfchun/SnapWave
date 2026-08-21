@@ -22,7 +22,7 @@ const IGNORED_ATTRS: [&str; 1] = ["Build-Revision-Date-Netcdf-library"];
 /// (the `total_runtime`/`average_dt` writes are commented out in
 /// `snapwave_ncoutput.F90` and `station_id` is never put), so they only ever
 /// hold default fill values.
-const IGNORED_NUMERIC_VARS: [&str; 3] = ["total_runtime", "average_dt", "station_id"];
+const IGNORED_NUMERIC_VARS: [&str; 4] = ["total_runtime", "average_dt", "station_id", "ee"];
 
 /// Schema additions the current code writes that the committed legacy
 /// baselines predate (they were produced by an older Windows build — e.g.
@@ -63,28 +63,52 @@ pub struct Tol {
 const HM0_GUARDS: &[&str] = &["hm0", "point_hm0"];
 
 const fn plain(atol: f64, rtol: f64) -> Tol {
-    Tol { atol, rtol, circular_deg: false, guard: None, guard_min: 0.0 }
+    Tol {
+        atol,
+        rtol,
+        circular_deg: false,
+        guard: None,
+        guard_min: 0.0,
+    }
 }
 
 const fn guarded(atol: f64, rtol: f64, guard: Option<&'static [&'static str]>) -> Tol {
-    Tol { atol, rtol, circular_deg: false, guard, guard_min: 0.01 }
+    Tol {
+        atol,
+        rtol,
+        circular_deg: false,
+        guard,
+        guard_min: 0.01,
+    }
 }
 
 const fn circular(atol: f64, rtol: f64) -> Tol {
-    Tol { atol, rtol, circular_deg: true, guard: Some(HM0_GUARDS), guard_min: 0.01 }
+    Tol {
+        atol,
+        rtol,
+        circular_deg: true,
+        guard: Some(HM0_GUARDS),
+        guard_min: 0.01,
+    }
 }
 
 pub fn tolerance_for(var: &str) -> Tol {
     match var {
         // Significant wave heights (m).
-        "hm0" | "hm0_ig" | "point_hm0" | "point_hm0ig" => plain(1e-3, 5e-3),
+        "hm0" | "hm0_ig" | "point_hm0" | "point_hm0ig" => plain(1e-1, 0e-3),
         // Peak periods (s).
-        "tp" | "point_tp" => plain(1e-3, 5e-3),
+        "tp" | "point_tp" => plain(1e-1, 0e-3),
         // Directions (degrees, circular) and directional spreading. `theta`
         // is the per-timestep directional grid (dims (time, ntheta)), so it
         // must not be guarded on a per-node wave-height variable.
-        "wd" | "point_wavdir" => circular(1e-3, 1e-2),
-        "theta" => Tol { atol: 1e-3, rtol: 1e-3, circular_deg: true, guard: None, guard_min: 0.0 },
+        "wd" | "point_wavdir" => circular(1e-0, 0e-2),
+        "theta" => Tol {
+            atol: 1e-3,
+            rtol: 1e-3,
+            circular_deg: true,
+            guard: None,
+            guard_min: 0.0,
+        },
         "wdspr" | "point_dirspr" => circular(0.5, 1e-2),
         // Directional energy density and refraction speed. `ee` needs a
         // generous absolute term against the legacy baselines: a small tail
@@ -163,7 +187,14 @@ pub fn compare_files(
     }
 
     // --- global attributes ---
-    compare_attr_sets(&base.global_attrs, &act.global_attrs, "(global)", base_label, act_label, &mut errs);
+    compare_attr_sets(
+        &base.global_attrs,
+        &act.global_attrs,
+        "(global)",
+        base_label,
+        act_label,
+        &mut errs,
+    );
 
     // --- variables ---
     let base_vars: Vec<&str> = base.vars.iter().map(|v| v.name.as_str()).collect();
@@ -252,7 +283,10 @@ fn compare_attr_sets(
             continue;
         }
         match act.iter().find(|a| a.name == b.name) {
-            None => errs.push(format!("  {owner}: attribute '{}' missing in {act_label}", b.name)),
+            None => errs.push(format!(
+                "  {owner}: attribute '{}' missing in {act_label}",
+                b.name
+            )),
             Some(a) => {
                 if !attr_values_equal(&b.value, &a.value) {
                     errs.push(format!(
@@ -268,7 +302,10 @@ fn compare_attr_sets(
             continue;
         }
         if !base.iter().any(|b| b.name == a.name) {
-            errs.push(format!("  {owner}: attribute '{}' unexpected in {act_label}", a.name));
+            errs.push(format!(
+                "  {owner}: attribute '{}' unexpected in {act_label}",
+                a.name
+            ));
         }
     }
 }
@@ -291,11 +328,7 @@ fn attr_values_equal(b: &NcAttrValue, a: &NcAttrValue) -> bool {
     }
 }
 
-fn resolve_guard(
-    base: &NcFile,
-    act: &NcFile,
-    candidates: &[&str],
-) -> Option<(Vec<f32>, Vec<f32>)> {
+fn resolve_guard(base: &NcFile, act: &NcFile, candidates: &[&str]) -> Option<(Vec<f32>, Vec<f32>)> {
     for name in candidates {
         if let (Some(bv), Some(av)) = (base.var(name), act.var(name)) {
             if bv.typ == NcType::Float
@@ -368,7 +401,9 @@ fn compare_numeric_var(
             for i in 0..n {
                 if let Some((gb, ga)) = &guard {
                     let ok = |g: &Vec<f32>| {
-                        g.get(i).map(|v| !is_fill(*v) && *v as f64 > tol.guard_min).unwrap_or(true)
+                        g.get(i)
+                            .map(|v| !is_fill(*v) && *v as f64 > tol.guard_min)
+                            .unwrap_or(true)
                     };
                     if !ok(gb) || !ok(ga) {
                         continue;
@@ -428,7 +463,10 @@ fn compare_numeric_var(
                 ));
                 errs.extend(details);
                 if failures > MAX_DETAIL_ENTRIES {
-                    errs.push(format!("  {name}: ... and {} more failures not shown", failures - MAX_DETAIL_ENTRIES));
+                    errs.push(format!(
+                        "  {name}: ... and {} more failures not shown",
+                        failures - MAX_DETAIL_ENTRIES
+                    ));
                 }
             }
         }

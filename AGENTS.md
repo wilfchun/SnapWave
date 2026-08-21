@@ -40,8 +40,8 @@ or `SNAPWAVE_ORACLE`), used only by the regression suite.
    `cargo build` (pure Rust) must both keep working. The Rust build needs no
    Fortran/C/NetCDF toolchain.
 4. **`src/snapwave.f90` is deliberately not compiled into the Cargo binary**
-   (Rust provides `main`). When changing the model lifecycle, keep
-   `src/snapwave.f90` and `src/snapwave_c_api.f90` in sync.
+   (Rust provides `main`). It is retained as the oracle's main program; keep
+   it working with the `make` build.
 5. **Follow the plan.md phase order** when picking what to move next
    (currently: Phases 1–10 are done; Phase 11 — solver internals — is
    next). Do not jump ahead to the solver.
